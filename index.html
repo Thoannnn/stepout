@@ -93,7 +93,7 @@ const CONFIG = {
     respawnDelayMs: 1000,        // spec 9: respawn on track after 1 s
     respawnPenaltyTime: 1.5,
     respawnKeepFrac: 0.35,       // speed fraction kept after respawn
-    respawnDropDepth: 6.5,       // metres below track surface that triggers fall-off respawn
+    respawnDropDepth: 14,        // metres below track surface (taller 4× track needs deeper fall trigger)
     perfectLandingAngleDeg: 10,  // clean nose alignment threshold on touchdown (spec 2)
     landingMinSpeed: 8,
     landingBoostGain: 16,
@@ -147,16 +147,16 @@ const CONFIG = {
   track: {
     roadHalfWidth: 12, wallHeight: 2.2, samples: 2000, frameDebugStep: 50,
     lanes: [-4, 4],              // P1 / P2 lateral spawn offsets
-    points: [                    // closed spline (x,y,z) — Y elevations 2× for bigger climbs / drops
-      [0, 6, -175], [36, 10, -158], [62, 14, -130], [68, 16, -96],            // entry + climb
+    points: [                    // closed spline (x,y,z) — Y elevations 4× original for big climbs / drops
+      [0, 12, -175], [36, 20, -158], [62, 28, -130], [68, 32, -96],          // entry + climb
       // Was R≈6 m (inner edge inverted vs hw=12). Opened north + spread E/W so min R ≳ 16 m.
-      [62, 16, -50], [50, 15.2, -10], [24, 13.6, 2], [-24, 10.4, 0],
-      [-52, 6.4, -24], [-64, 8, -78],                                       // exit hairpin into sweeping S
-      [-48, 12, -112], [-20, 16, -128], [10, 20, -132],                     // S continues + climb toward ramp
-      [34, 26, -150], [49, 33, -170],                                       // steep ramp + CREST peak (~t=0.635)
-      [56, 17, -205], [40, 8, -236], [8, 4, -252], [-24, 2, -248],           // drop across jump gap + landing apron
-      [-48, 6, -232], [-54, 12, -208],                                     // second banked sweep
-      [-42, 8, -192], [-20, 6, -186],                                       // return straight to start/finish
+      [62, 32, -50], [50, 30.4, -10], [24, 27.2, 2], [-24, 20.8, 0],
+      [-52, 12.8, -24], [-64, 16, -78],                                     // exit hairpin into sweeping S
+      [-48, 24, -112], [-20, 32, -128], [10, 40, -132],                     // S continues + climb toward ramp
+      [34, 52, -150], [49, 66, -170],                                       // steep ramp + CREST peak (~t=0.635)
+      [56, 34, -205], [40, 16, -236], [8, 8, -252], [-24, 4, -248],         // drop across jump gap + landing apron
+      [-48, 12, -232], [-54, 24, -208],                                     // second banked sweep
+      [-42, 16, -192], [-20, 12, -186],                                     // return straight to start/finish
     ],
     bankKeys: [{ t: 0.25, bank: 0.28 }, { t: 0.45, bank: -0.22 }, { t: 0.78, bank: -0.42 }, { t: 0.94, bank: 0.0 }],
     jumpGap: [0.642, 0.678],     // road missing right AFTER the crest peak so ships launch cleanly across
@@ -532,15 +532,14 @@ function refreshTouchAirbrakes() {
 }
 function fireMobileBoost() {
   touchCtl.boostUntil = performance.now() + CONFIG.input.mobileBoostMs;
-  // Fill energy so the 4s swipe boost isn't cut short by the drain meter
+  // Meter starts full and counts down over the swipe window (see stepShip)
   if (typeof ships !== 'undefined' && ships[0]) {
-    const need = CONFIG.ships.boostDrain * (CONFIG.input.mobileBoostMs / 1000) + 4;
-    ships[0].boostEnergy = Math.min(CONFIG.ships.maxEnergy, Math.max(ships[0].boostEnergy, need));
+    ships[0].boostEnergy = CONFIG.ships.maxEnergy;
   }
   if (touchBoostFlash) {
     touchBoostFlash.classList.add('on');
     clearTimeout(touchBoostFlash._t);
-    touchBoostFlash._t = setTimeout(() => touchBoostFlash.classList.remove('on'), Math.min(900, CONFIG.input.mobileBoostMs));
+    touchBoostFlash._t = setTimeout(() => touchBoostFlash.classList.remove('on'), 700);
   }
 }
 function setupMobileTouch() {
@@ -1356,7 +1355,8 @@ function stepShip(ship, dt) {
   }
 
   // ---- 1. Steering & Airbrakes (yaw relative to track frame) --------------
-  const boosting = !!(inp.boost && ship.boostEnergy > 0);
+  const mobileBoostHold = isMobile && ship.player === 0 && performance.now() < touchCtl.boostUntil;
+  const boosting = !!(inp.boost && (ship.boostEnergy > 0 || mobileBoostHold));
   const effTop = st.topSpeed * (1 + (boosting ? H.boostTopSpeedBonus : 0));
   ship.effTop = effTop;
 
@@ -1552,10 +1552,10 @@ function stepShip(ship, dt) {
   ship.height = heightNow;
 
   // ---- 7. Boost Energy & Clean Drift Rewards (spec 7 & 10) ----------------
-  const mobileBoostHold = isMobile && ship.player === 0 && performance.now() < touchCtl.boostUntil;
   if (mobileBoostHold) {
-    // Swipe-up grants a full timed boost window — keep energy alive for the whole duration
-    ship.boostEnergy = Math.max(ship.boostEnergy, 8);
+    // Visual countdown: bar drains 100% → 0% across the swipe boost window
+    const rem = Math.max(0, touchCtl.boostUntil - performance.now());
+    ship.boostEnergy = (rem / CONFIG.input.mobileBoostMs) * H.maxEnergy;
   } else if (boosting) {
     ship.boostEnergy = Math.max(0, ship.boostEnergy - H.boostDrain * dt);
   } else {
@@ -3598,10 +3598,15 @@ function hudText(player, fpsStr, nowMs) {
   }
   const curLapNum = Math.min(CONFIG.race.totalLaps, s.lap + 1);
   const curLapTime = state.phase === 'racing' && !s.finished ? fmtTime(nowMs - s.lapStartMs) : (s.finished ? fmtTime(s.totalRaceMs) : '0:00.00');
+  const mobileBoosting = isMobile && player === 0 && nowMs < touchCtl.boostUntil;
   const boostPct = Math.max(0, Math.min(100, s.boostEnergy));
+  const boostSecLeft = mobileBoosting ? ((touchCtl.boostUntil - nowMs) / 1000) : 0;
   const raceTime = state.phase === 'racing' ? fmtTime(nowMs - state.raceStartMs) : fmtTime(s.totalRaceMs);
 
   const badges = [];
+  if (mobileBoosting) {
+    badges.push(`<span style="background:#19c8ff;color:#040810;padding:3px 10px;border-radius:4px;font-weight:900;letter-spacing:1px;box-shadow:0 0 14px #19c8ffaa">BOOST ${boostSecLeft.toFixed(1)}s</span>`);
+  }
   if (solo && ghost.best) {
     const d = ghostDeltaMs(s, nowMs);
     if (d != null && state.phase === 'racing' && !s.finished) {
@@ -3648,9 +3653,9 @@ function hudText(player, fpsStr, nowMs) {
         `<span style="font-size:24px;font-weight:900;color:#fff">${kmh}</span> <span style="font-size:11px;color:#9ab6dc">KM/H</span>` +
       `</div>` +
       `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;justify-content:flex-end;">` +
-        `<span style="font-size:10px;letter-spacing:1px;color:#9ab6dc">BOOST</span>` +
-        `<div style="width:92px;height:7px;background:rgba(255,255,255,.14);border-radius:4px;overflow:hidden;">` +
-          `<div style="width:${boostPct.toFixed(0)}%;height:100%;background:${col};box-shadow:0 0 8px ${col}"></div>` +
+        `<span style="font-size:${isMobile ? 11 : 10}px;letter-spacing:1px;color:${mobileBoosting ? '#19c8ff' : '#9ab6dc'};font-weight:${mobileBoosting ? 800 : 400}">BOOST${mobileBoosting ? ' ' + boostSecLeft.toFixed(1) + 's' : ''}</span>` +
+        `<div style="width:${isMobile ? 120 : 92}px;height:${isMobile ? 12 : 7}px;background:rgba(255,255,255,.14);border-radius:4px;overflow:hidden;${mobileBoosting ? 'box-shadow:0 0 10px #19c8ff66;outline:1px solid #19c8ff88' : ''}">` +
+          `<div style="width:${boostPct.toFixed(0)}%;height:100%;background:${mobileBoosting ? '#19c8ff' : col};box-shadow:0 0 8px ${mobileBoosting ? '#19c8ff' : col};transition:width .05s linear"></div>` +
         `</div>` +
       `</div>` +
     `</div>`
