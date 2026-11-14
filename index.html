@@ -147,16 +147,16 @@ const CONFIG = {
   track: {
     roadHalfWidth: 12, wallHeight: 2.2, samples: 2000, frameDebugStep: 50,
     lanes: [-4, 4],              // P1 / P2 lateral spawn offsets
-    points: [                    // closed spline control points (x,y,z) — climbs, 180° hairpin (R≳hw so inner edge never folds), fast S, crest + jump
-      [0, 3, -175], [36, 5, -158], [62, 7, -130], [68, 8, -96],              // entry + climb
+    points: [                    // closed spline (x,y,z) — Y elevations 2× for bigger climbs / drops
+      [0, 6, -175], [36, 10, -158], [62, 14, -130], [68, 16, -96],            // entry + climb
       // Was R≈6 m (inner edge inverted vs hw=12). Opened north + spread E/W so min R ≳ 16 m.
-      [62, 8, -50], [50, 7.6, -10], [24, 6.8, 2], [-24, 5.2, 0],
-      [-52, 3.2, -24], [-64, 4, -78],                                       // exit hairpin into sweeping S
-      [-48, 6, -112], [-20, 8, -128], [10, 10, -132],                       // S continues + climb toward ramp
-      [34, 13, -150], [49, 16.5, -170],                                     // steep ramp + CREST peak (~t=0.635)
-      [56, 8.5, -205], [40, 4, -236], [8, 2, -252], [-24, 1, -248],         // drop across jump gap + landing apron
-      [-48, 3, -232], [-54, 6, -208],                                       // second banked sweep
-      [-42, 4, -192], [-20, 3, -186],                                       // return straight to start/finish
+      [62, 16, -50], [50, 15.2, -10], [24, 13.6, 2], [-24, 10.4, 0],
+      [-52, 6.4, -24], [-64, 8, -78],                                       // exit hairpin into sweeping S
+      [-48, 12, -112], [-20, 16, -128], [10, 20, -132],                     // S continues + climb toward ramp
+      [34, 26, -150], [49, 33, -170],                                       // steep ramp + CREST peak (~t=0.635)
+      [56, 17, -205], [40, 8, -236], [8, 4, -252], [-24, 2, -248],           // drop across jump gap + landing apron
+      [-48, 6, -232], [-54, 12, -208],                                     // second banked sweep
+      [-42, 8, -192], [-20, 6, -186],                                       // return straight to start/finish
     ],
     bankKeys: [{ t: 0.25, bank: 0.28 }, { t: 0.45, bank: -0.22 }, { t: 0.78, bank: -0.42 }, { t: 0.94, bank: 0.0 }],
     jumpGap: [0.642, 0.678],     // road missing right AFTER the crest peak so ships launch cleanly across
@@ -221,7 +221,7 @@ const CONFIG = {
     // Mobile touch (1P): hold L/R halves = airbrakes, auto thrust, swipe up = boost
     mobileSwipeMinPx: 56,
     mobileSwipeMaxMs: 420,
-    mobileBoostMs: 520,
+    mobileBoostMs: 4000,         // swipe-up boost hold (ms)
     mobileEdgePadPx: 12,
   },
 };
@@ -532,10 +532,15 @@ function refreshTouchAirbrakes() {
 }
 function fireMobileBoost() {
   touchCtl.boostUntil = performance.now() + CONFIG.input.mobileBoostMs;
+  // Fill energy so the 4s swipe boost isn't cut short by the drain meter
+  if (typeof ships !== 'undefined' && ships[0]) {
+    const need = CONFIG.ships.boostDrain * (CONFIG.input.mobileBoostMs / 1000) + 4;
+    ships[0].boostEnergy = Math.min(CONFIG.ships.maxEnergy, Math.max(ships[0].boostEnergy, need));
+  }
   if (touchBoostFlash) {
     touchBoostFlash.classList.add('on');
     clearTimeout(touchBoostFlash._t);
-    touchBoostFlash._t = setTimeout(() => touchBoostFlash.classList.remove('on'), CONFIG.input.mobileBoostMs);
+    touchBoostFlash._t = setTimeout(() => touchBoostFlash.classList.remove('on'), Math.min(900, CONFIG.input.mobileBoostMs));
   }
 }
 function setupMobileTouch() {
@@ -1547,7 +1552,11 @@ function stepShip(ship, dt) {
   ship.height = heightNow;
 
   // ---- 7. Boost Energy & Clean Drift Rewards (spec 7 & 10) ----------------
-  if (boosting) {
+  const mobileBoostHold = isMobile && ship.player === 0 && performance.now() < touchCtl.boostUntil;
+  if (mobileBoostHold) {
+    // Swipe-up grants a full timed boost window — keep energy alive for the whole duration
+    ship.boostEnergy = Math.max(ship.boostEnergy, 8);
+  } else if (boosting) {
     ship.boostEnergy = Math.max(0, ship.boostEnergy - H.boostDrain * dt);
   } else {
     const onLine = grounded && Math.abs(ship.lane) <= P.racingLineAbsLane;
