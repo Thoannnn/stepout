@@ -1,0 +1,3845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>StepOut — Anti-Gravity Racer</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#c48a5a;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+  #mobile-touch-layer{position:fixed;inset:0;z-index:7;pointer-events:none;display:none}
+  #mobile-touch-layer .zone{position:absolute;bottom:0;top:18%;width:42%;pointer-events:none;display:flex;align-items:flex-end;justify-content:center;padding-bottom:max(18px,env(safe-area-inset-bottom));box-sizing:border-box;transition:background .08s,opacity .08s;opacity:.35}
+  #mobile-touch-layer .zone.left{left:0;background:linear-gradient(90deg,rgba(25,200,255,.22),transparent)}
+  #mobile-touch-layer .zone.right{right:0;background:linear-gradient(270deg,rgba(255,47,208,.22),transparent)}
+  #mobile-touch-layer .zone.on{opacity:.85}
+  #mobile-touch-layer .zone span{font:700 12px/1.2 ui-monospace,monospace;letter-spacing:1.5px;color:#eaf4ff;text-shadow:0 0 10px rgba(0,0,0,.8);padding:8px 12px;border-radius:8px;background:rgba(4,8,16,.45);border:1px solid rgba(255,255,255,.18)}
+  #mobile-touch-layer .boost-flash{position:absolute;left:50%;top:22%;transform:translate(-50%,-50%);font:900 16px/1 system-ui,sans-serif;letter-spacing:3px;color:#fff;text-shadow:0 0 18px #19c8ff;opacity:0;pointer-events:none;transition:opacity .15s}
+  #mobile-touch-layer .boost-flash.on{opacity:1}
+  #mobile-hint{position:fixed;left:50%;bottom:max(10px,env(safe-area-inset-bottom));transform:translateX(-50%);z-index:8;pointer-events:none;display:none;max-width:92vw;text-align:center;font:600 11px/1.35 ui-monospace,monospace;color:#cfe3ff;background:rgba(5,8,14,.75);padding:6px 12px;border-radius:8px;border:1px solid rgba(100,150,220,.25)}
+</style>
+</head>
+<body>
+<div id="mobile-touch-layer" aria-hidden="true">
+  <div class="zone left" id="touch-zone-l"><span>AIR L</span></div>
+  <div class="zone right" id="touch-zone-r"><span>AIR R</span></div>
+  <div class="boost-flash" id="touch-boost-flash">BOOST</div>
+</div>
+<div id="mobile-hint">HOLD left/right = airbrake · auto thrust · SWIPE UP = boost</div>
+<script type="importmap">
+{"imports":{
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+import { RoomEnvironment } from "https://unpkg.com/three@0.160.0/examples/jsm/environments/RoomEnvironment.js";
+import { EffectComposer } from "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { ShaderPass } from "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/ShaderPass.js";
+import { FXAAShader } from "https://unpkg.com/three@0.160.0/examples/jsm/shaders/FXAAShader.js";
+import { OutputPass } from "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/OutputPass.js";
+/* ============================================================ CONFIG ==== */
+/* All tunable numbers live here. No magic numbers in logic below.        */
+const CONFIG = {
+  physics: {
+    fixedHz: 120,
+    maxCatchupSteps: 8,          // clamp the accumulator so a stall doesn't spiral
+    thrustKnee: 0.70,            // fraction of effTop speed with full thrust (spec 3)
+    coastDrag: 0.32,             // 1/s exponential decay when off-throttle
+    overSpeedDamp: 3.5,          // 1/s smooth bleed back to effTop after pad/boost overspeed
+    steerSpeedTaper: 0.34,       // A/D carves fast S-bends cleanly at 0 drag & 0 wall hits, while 180° hairpins still demand Q/E!
+    airbrakeYawGain: 1.28,       // pivot yaw when tapping one airbrake alone
+    airbrakeComboYawBonus: 1.22, // +22% sharper rotation when COMBINING same-side steer + airbrake (A+Q or D+E)!
+    airbrakeSoloGripMult: 0.72,  // airbrake ALONE loosens the tail into a classic WipeOut pivot-drift!
+    airbrakeComboGripMult: 1.65, // airbrake + same-side steer hooks the apex with strong lateral bite!
+    airbrakeSoloDragFrac: 0.22,  // noticeable drag if spamming Q/E alone on fast S-curves (so A/D wins on fast sweepers!)
+    airbrakeComboDragFrac: 0.05, // clean, low-drag apex carve when combining steer + airbrake!
+    sideshiftWindowMs: 280,      // double-tap Q-Q / E-E (or ,-, / .-.) window for instant WipeOut sideshift!
+    sideshiftCooldownMs: 650,    // cooldown between sideshifts
+    sideshiftImpulse: 17.5,      // m/s lateral snap velocity without rotating the nose!
+    hardBrakeFactor: 1.35,       // both airbrakes (or S + airbrake) = hard brake
+    plainBrakeFrac: 0.65,        // plain S brake
+    groundedAlignRate: 1.4,      // 1/s gentle nose alignment toward travel direction
+    gripAirMult: 0.18,           // lateral grip multiplier while airborne (spec 2/4: keeps momentum in air)
+    driftMinDeg: 8,              // slip angle (deg) that counts as a clean airbrake/corner drift (spec 10)
+    driftMinSpeed: 18,           // m/s minimum speed to earn drift meter
+    driftAwardRate: 22,          // boost units/s granted while drifting cleanly without wall contact
+    racingLineAbsLane: 2.8,      // |lane| within this = riding the racing line
+    racingLineBoostRegenGain: 1.65, // faster boost regen on the racing line (spec 7 — fixes NaN bug)
+    steerSign: 1,                // KeyD / ArrowRight yaws toward +lane (visible right-hand side)
+  },
+  ships: {                       // shared ship constants + the two identities (all tunables here)
+    size: 2.2,
+    colors: ['#19c8ff', '#ff2fd0'],   // P1 cyan / P2 magenta
+    hoverHeight: 1.5,            // canonical value used by hover spring
+    engineGlowIntensity: 3,
+    shipTypes: {                 // VOLT: high speed/thrust, wide turn, drifty; ARC: lower top, sharp turn, strong airbrake, grippy
+      volt: { label: 'VOLT', topSpeed: 62, accel: 46, steerRate: 1.50, lateralGrip: 2.8, airbrake: 32, hoverK: 34, hoverDamp: 10.5 },
+      arc:  { label: 'ARC',  topSpeed: 54, accel: 40, steerRate: 1.92, lateralGrip: 6.0, airbrake: 52, hoverK: 36, hoverDamp: 11.0 },
+    },
+    shipPickDefault: 'volt',
+    maxEnergy: 100, boostDrain: 28, boostRegenIdle: 9, energyStartFrac: 0.5,
+    maxShield: 100,
+    wallMargin: 0.9,
+    wallGrazingLoss: 0.06,       // small speed loss on shallow wall scrape (spec 6)
+    wallHeadOnLoss: 0.52,        // heavy speed loss on steep/head-on wall hit (spec 6)
+    wallBounceRestitution: 0.45, // inward bounce velocity fraction on steep hits
+    wallMinBounceSpeed: 3.5,     // minimum inward push so ships never glue to walls
+    wallScrapeBand: 1.4,         // proximity band for wall-scrape sparks/feedback
+    respawnDelayMs: 1000,        // spec 9: respawn on track after 1 s
+    respawnPenaltyTime: 1.5,
+    respawnKeepFrac: 0.35,       // speed fraction kept after respawn
+    respawnDropDepth: 6.5,       // metres below track surface that triggers fall-off respawn
+    perfectLandingAngleDeg: 10,  // clean nose alignment threshold on touchdown (spec 2)
+    landingMinSpeed: 8,
+    landingBoostGain: 16,
+    landingSpeedBonusFrac: 0.08, // speed kick on perfect landing
+    badLandingScrubFrac: 0.14,   // sloppy landing scrubs speed (spec 2)
+    maxHoverDist: 3.4,           // spring range; beyond this the ship goes airborne
+    airPitchRate: 4.5,           // how fast nose pitches along world velocity in mid-air
+    maxPitchRad: 0.65,
+    gravity: 16.5,               // arcade gravity along world -Y so crests & jump gaps feel punchy
+    visualRollRate: 7.5, visualPitchRate: 6.0,
+    wallFlashMs: 600, landingFlashMs: 1200,
+    boostThrustMult: 1.75, boostTopSpeedBonus: 0.32, speedCurveExponent: 0.75,
+    padInstantKick: 14,          // instant velocity kick on hitting a boost pad (spec 7)
+    padCapFrac: 1.38,            // pad overspeed ceiling as fraction of topSpeed
+    padCooldownMs: 650,          // prevents re-triggering the same pad every tick
+    slideVisualGain: 0.055, pitchVisualGain: 0.22, maxVisualRoll: 0.68,
+    groundUpLerpRate: 9.0,       // smooth slerp rate aligning ship up-vector to track normal (spec 1)
+    shipCollisionRadius: 3.2, collisionImpulse: 1.35, collisionSideShove: 6.0,
+    airbrakeLateralGain: 1.45,   // extra lateral bite on airbrake side (spec 5)
+  },
+  camera: {
+    fovBase: 52, fovMax: 63, speedRefForFov: 82, fovLerp: 5.5,
+    backDistance: 6.3, upDistance: 2.35, lookAhead: 5.8,
+    springStiffness: 65,         // smooth spring ON THE LOCAL OFFSET, so zero distance lag at 600+ km/h!
+    upLerpRate: 9.0,
+    shakeGain: 0.40,             // shake on landing, walls, boost
+    shakeDecay: 7.5,
+    upInfluence: 0.42,           // fraction of track-up vector the camera adopts
+  },
+  render: {
+    clearColor: '#d4a878',
+    fogColor: '#d4a878',         // warm golden-hour depth fog
+    fogNear: 22,
+    fogFar: 165,
+    toneMappingExposure: 1.08, maxPixelRatio: 1.0, preserveDrawingBuffer: true,
+    msaaSamples: 0,              // zero MSAA resolve stall on HalfFloat RT -> combined FXAA pass gives smooth edges at 144 FPS!
+    shipReflectionOpacity: 0.58, // glossy wet-asphalt reflection opacity (depth-tested ON the road surface!)
+    hemisphereIntensity: 1.15,
+    gridSize: 460, gridDivisions: 46, gridY: -4,
+    materialRoughness: 0.12, materialMetalness: 0.58,
+    bloomStrength: 0.22, bloomRadius: 0.28, bloomThreshold: 1.20,
+    chromaMax: 0.0018,           // subtle high-speed radial chromatic aberration at edges
+    trailPoints: 28, trailHalfWidth: 0.52,
+    maxSparks: 90,
+    windCount: 40,               // tight condensation wake behind thrusters
+    windTipCount: 36,            // wing-tip vortex wisps (split L/R)
+    windSize: 0.72,
+    windTipSize: 0.48,
+    windSpeedRef: 48,            // m/s where wind gallery is fully visible
+  },
+  track: {
+    roadHalfWidth: 12, wallHeight: 2.2, samples: 2000, frameDebugStep: 50,
+    lanes: [-4, 4],              // P1 / P2 lateral spawn offsets
+    points: [                    // closed spline control points (x,y,z) — climbs, 180° hairpin (R≳hw so inner edge never folds), fast S, crest + jump
+      [0, 3, -175], [36, 5, -158], [62, 7, -130], [68, 8, -96],              // entry + climb
+      // Was R≈6 m (inner edge inverted vs hw=12). Opened north + spread E/W so min R ≳ 16 m.
+      [62, 8, -50], [50, 7.6, -10], [24, 6.8, 2], [-24, 5.2, 0],
+      [-52, 3.2, -24], [-64, 4, -78],                                       // exit hairpin into sweeping S
+      [-48, 6, -112], [-20, 8, -128], [10, 10, -132],                       // S continues + climb toward ramp
+      [34, 13, -150], [49, 16.5, -170],                                     // steep ramp + CREST peak (~t=0.635)
+      [56, 8.5, -205], [40, 4, -236], [8, 2, -252], [-24, 1, -248],         // drop across jump gap + landing apron
+      [-48, 3, -232], [-54, 6, -208],                                       // second banked sweep
+      [-42, 4, -192], [-20, 3, -186],                                       // return straight to start/finish
+    ],
+    bankKeys: [{ t: 0.25, bank: 0.28 }, { t: 0.45, bank: -0.22 }, { t: 0.78, bank: -0.42 }, { t: 0.94, bank: 0.0 }],
+    jumpGap: [0.642, 0.678],     // road missing right AFTER the crest peak so ships launch cleanly across
+    boostPadsT: [0.06, 0.37, 0.58, 0.86], padLenAlong: 6.5, padAcross: 4.6,
+    startLineT: 0.015, startLineEmissive: '#e8f6ff', padColor: '#22d7a0',
+    // Tight-curve palette: open stretches stay cool; tighter bends go hot amber on road + rails
+    railOpenL: '#19e6ff', railOpenR: '#ff2fd0',
+    railTight: '#ff9a2a',
+    roadOpen: '#d8e6ff',
+    roadTight: '#ff8a28',
+    railTightCurvature: 0.038,   // rad/m — hairpin ~0.045+ goes fully warm after the widened apex
+    // Interactive LEGO props in the racing line (crate/tower smash, stud collect)
+    legoProps: [
+      { t: 0.09, lane: 0, kind: 'crate' },
+      { t: 0.14, lane: -3.2, kind: 'stud' },
+      { t: 0.14, lane: 3.2, kind: 'stud' },
+      { t: 0.21, lane: 0, kind: 'tower' },
+      { t: 0.31, lane: 2.4, kind: 'crate' },
+      { t: 0.42, lane: -2.0, kind: 'stud' },
+      { t: 0.48, lane: 0, kind: 'crate' },
+      { t: 0.55, lane: 3.0, kind: 'tower' },
+      { t: 0.72, lane: -2.6, kind: 'crate' },
+      { t: 0.78, lane: 0, kind: 'stud' },
+      { t: 0.84, lane: 2.2, kind: 'crate' },
+      { t: 0.92, lane: -1.5, kind: 'tower' },
+    ],
+    legoHitRadius: 2.35,
+    legoStudRadius: 2.1,
+    legoRespawnMs: 4200,
+    legoStudBoost: 18,
+    legoCrateBoost: 10,
+    legoSmashImpulse: 9.5,
+    legoScale: 2.35,
+  },
+  hud: { fontSizePx: 13, marginPx: 14 },
+  race: {
+    totalLaps: 3,
+    countdownBeatMs: 900,      // 3 - 2 - 1 (~2.7 s total), then GO!
+    goBannerMs: 900,
+    checkpointMidFrac: 0.48,   // must pass mid-track checkpoint so reversing across start never counts a lap
+    ghostSampleHz: 30,         // local ghost recording rate
+    ghostStorageKey: 'stepout-ghost-best',
+    shipStatsDisplay: {
+      volt: { speed: 95, handling: 58, thrust: 92, desc: 'High top speed & fierce thrust · wide drift arcs' },
+      arc:  { speed: 80, handling: 95, thrust: 78, desc: 'Razor-sharp turn-in · powerful airbrakes & high grip' },
+    },
+  },
+  input: {
+    p1: { up:'KeyW', down:'KeyS', left:'KeyA', right:'KeyD', brakeL:'KeyQ', brakeR:'KeyE', boost:'ShiftLeft' },
+    p2: { up:'ArrowUp', down:'ArrowDown', left:'ArrowLeft', right:'ArrowRight', brakeL:'Comma', brakeR:'Period', boost:'ShiftRight' },
+    debugToggle: 'F1', debugFrames: 'F2', restart: 'KeyR',
+    // Standard Gamepad mapping (Xbox / DualShock via browser remap)
+    padDeadzone: 0.18,
+    padSteerAxis: 0,             // left stick X
+    padThrottleBtn: 7,           // RT
+    padBrakeBtn: 6,              // LT
+    padAirL: 4,                  // LB / L1
+    padAirR: 5,                  // RB / R1
+    padA: 0, padB: 1, padX: 2, padY: 3,
+    padBack: 8, padStart: 9,
+    padDpadU: 12, padDpadD: 13, padDpadL: 14, padDpadR: 15,
+    // Mobile touch (1P): hold L/R halves = airbrakes, auto thrust, swipe up = boost
+    mobileSwipeMinPx: 56,
+    mobileSwipeMaxMs: 420,
+    mobileBoostMs: 520,
+    mobileEdgePadPx: 12,
+  },
+};
+
+/* ============================================================ DIAG ====== */
+/* Dev-only instrumentation for phase verification (kept until phase 7).   */
+window.__errors = []; window.__errorCount = 0;
+const origConsoleError = console.error.bind(console);
+console.error = function (...args) {
+  window.__errorCount++; window.__errors.push(args.map(String).join(' '));
+  origConsoleError(...args);
+};
+window.addEventListener('error', (e) => {
+  window.__errorCount++; window.__errors.push('window.onerror: ' + (e.message || e.type));
+});
+
+/* ============================================================ INPUT ===== */
+const heldKeys = new Set();
+const airbrakeTapState = [
+  { lastL: -1e9, lastR: -1e9, pendingDir: 0 },
+  { lastL: -1e9, lastR: -1e9, pendingDir: 0 },
+];
+// Persistent edge state — Gamepad snapshots from getGamepads() must not be mutated
+const padPrev = [
+  { lb: false, rb: false, a: false, b: false, x: false, y: false, start: false, back: false, left: false, right: false, up: false, down: false },
+  { lb: false, rb: false, a: false, b: false, x: false, y: false, start: false, back: false, left: false, right: false, up: false, down: false },
+];
+let padsConnected = 0;
+let padNames = [];
+let padLastActivityMs = 0;
+let padSlotMap = [-1, -1]; // player → navigator gamepad index (first connected → P1)
+let bridgePads = []; // from local pad-bridge.mjs (Linux js0 fallback when Chrome Gamepad API is empty)
+let bridgeOk = false;
+
+function checkAirbrakeDoubleTap(code) {
+  const now = performance.now();
+  const win = CONFIG.physics.sideshiftWindowMs;
+  const m1 = CONFIG.input.p1, m2 = CONFIG.input.p2;
+  if (code === m1.brakeL) {
+    if (now - airbrakeTapState[0].lastL <= win) { airbrakeTapState[0].pendingDir = -1; airbrakeTapState[0].lastL = -1e9; }
+    else airbrakeTapState[0].lastL = now;
+  } else if (code === m1.brakeR) {
+    if (now - airbrakeTapState[0].lastR <= win) { airbrakeTapState[0].pendingDir = 1; airbrakeTapState[0].lastR = -1e9; }
+    else airbrakeTapState[0].lastR = now;
+  } else if (code === m2.brakeL) {
+    if (now - airbrakeTapState[1].lastL <= win) { airbrakeTapState[1].pendingDir = -1; airbrakeTapState[1].lastL = -1e9; }
+    else airbrakeTapState[1].lastL = now;
+  } else if (code === m2.brakeR) {
+    if (now - airbrakeTapState[1].lastR <= win) { airbrakeTapState[1].pendingDir = 1; airbrakeTapState[1].lastR = -1e9; }
+    else airbrakeTapState[1].lastR = now;
+  }
+}
+
+function padButton(gp, idx) {
+  const b = gp.buttons[idx];
+  if (!b) return { pressed: false, value: 0 };
+  return { pressed: !!b.pressed || b.value > 0.5, value: typeof b.value === 'number' ? b.value : (b.pressed ? 1 : 0) };
+}
+
+function isNintendoPad(gp) {
+  const id = (gp.id || '').toLowerCase();
+  return id.includes('pro controller') || id.includes('nintendo') || id.includes('joy-con')
+    || id.includes('057e') || id.includes('switch');
+}
+
+/* Collect connected pads in stable order — never assume index === player.
+   Prefer browser Gamepad API; if empty, use local pad-bridge (Linux /dev/input/js*). */
+function listConnectedPads() {
+  const out = [];
+  if (navigator.getGamepads) {
+    const gps = navigator.getGamepads();
+    for (let i = 0; i < gps.length; i++) {
+      const gp = gps[i];
+      if (gp && gp.connected) out.push(gp);
+    }
+  }
+  if (out.length) {
+    out.sort((a, b) => a.index - b.index);
+    return out;
+  }
+  // Bridge pads already look like Gamepad-ish objects
+  return bridgePads.filter((g) => g && g.connected);
+}
+
+function connectPadBridge() {
+  if (typeof WebSocket === 'undefined') return;
+  let retryMs = 800;
+  const hook = () => {
+    let ws;
+    try { ws = new WebSocket('ws://127.0.0.1:8018'); }
+    catch { setTimeout(hook, retryMs); return; }
+    ws.onopen = () => { bridgeOk = true; retryMs = 800; refreshPadSlots(); };
+    ws.onclose = () => {
+      bridgeOk = false; bridgePads = []; refreshPadSlots();
+      setTimeout(hook, retryMs);
+      retryMs = Math.min(5000, retryMs * 1.5);
+    };
+    ws.onerror = () => { try { ws.close(); } catch { /* */ } };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type !== 'pads' && msg.type !== 'hello') return;
+        bridgePads = (msg.pads || []).map((p) => ({
+          id: p.id || 'Bridge Pad',
+          index: p.index,
+          connected: true,
+          mapping: '',
+          axes: p.axes || [0, 0, 0, 0],
+          buttons: (p.buttons || []).map((b) => ({
+            pressed: !!(b && b.pressed),
+            value: b && typeof b.value === 'number' ? b.value : (b && b.pressed ? 1 : 0),
+          })),
+        }));
+        refreshPadSlots();
+      } catch { /* ignore */ }
+    };
+  };
+  hook();
+}
+connectPadBridge();
+
+function refreshPadSlots() {
+  const list = listConnectedPads();
+  const prev = padsConnected;
+  padsConnected = list.length;
+  padNames = list.map((g) => (g.id || 'Pad').split('(')[0].trim().slice(0, 28));
+  padSlotMap[0] = list[0] ? list[0].index : -1;
+  padSlotMap[1] = list[1] ? list[1].index : -1;
+  if (typeof updateControlsHint === 'function') updateControlsHint();
+  if (prev !== padsConnected && typeof state !== 'undefined' && state.phase === 'select' && typeof renderSelectUI === 'function') {
+    renderSelectUI();
+  }
+}
+
+function gamepadForPlayer(player) {
+  const list = listConnectedPads();
+  if (!list.length) return null;
+  // Prefer sticky slot map; fall back to ordinal (1st pad → P1)
+  const want = padSlotMap[player];
+  if (want >= 0) {
+    const hit = list.find((g) => g.index === want);
+    if (hit) return hit;
+  }
+  return list[player] || null;
+}
+
+function axisLive(gp, idx, dead) {
+  const v = gp.axes[idx];
+  if (typeof v !== 'number' || Number.isNaN(v)) return 0;
+  return Math.abs(v) > dead ? v : 0;
+}
+
+/* Normalize any pad (Xbox standard OR raw Switch Pro / Linux joydev) into one shape. */
+function decodePad(gp) {
+  if (!gp) return null;
+  const dead = CONFIG.input.padDeadzone;
+  const nintend = isNintendoPad(gp);
+  const rawMap = !gp.mapping || gp.mapping !== 'standard';
+
+  let steer = axisLive(gp, 0, dead);
+  const stickY = axisLive(gp, 1, dead);
+
+  // D-pad: standard buttons 12–15 + HAT axes (Linux Switch Pro uses hat after sticks)
+  let dL = padButton(gp, 14).pressed;
+  let dR = padButton(gp, 15).pressed;
+  let dU = padButton(gp, 12).pressed;
+  let dD = padButton(gp, 13).pressed;
+  const axN = gp.axes.length;
+  const hatPairs = [[6, 7], [4, 5], [axN - 2, axN - 1]];
+  for (const [hxI, hyI] of hatPairs) {
+    if (hxI < 0 || hyI >= axN) continue;
+    const hx = gp.axes[hxI], hy = gp.axes[hyI];
+    if (typeof hx === 'number') { if (hx < -0.5) dL = true; if (hx > 0.5) dR = true; }
+    if (typeof hy === 'number') { if (hy < -0.5) dU = true; if (hy > 0.5) dD = true; }
+  }
+  if (dL) steer = -1;
+  if (dR) steer = 1;
+
+  const b0 = padButton(gp, 0); // Xbox A / Switch B
+  const b1 = padButton(gp, 1); // Xbox B / Switch A
+  const b2 = padButton(gp, 2); // Xbox X / Switch Y
+  const b3 = padButton(gp, 3); // Xbox Y / Switch X
+  const lSh = padButton(gp, 4); // L / LB — airbrake L
+  const rSh = padButton(gp, 5); // R / RB — airbrake R
+  const b6 = padButton(gp, 6); // LT / ZL
+  const b7 = padButton(gp, 7); // RT / ZR
+  let ltVal = b6.value;
+  let rtVal = b7.value;
+  // Analog triggers only on standard mapping (Xbox LT/RT). Raw Switch Pro uses
+  // axes 2–5 as stick/hat resting at 0 — never treat resting 0 as half-pulled!
+  if (gp.mapping === 'standard') {
+    for (const [ai, which] of [[2, 'lt'], [3, 'lt'], [5, 'rt']]) {
+      const v = gp.axes[ai];
+      if (typeof v !== 'number') continue;
+      let uni = 0;
+      if (v >= 0 && v <= 1.01) uni = v;             // already 0..1
+      else if (v < -0.2) uni = 0;                   // bipolar rest ≈ -1
+      else if (v > -1.01 && v <= 1.01) uni = (v + 1) * 0.5;
+      if (which === 'lt') ltVal = Math.max(ltVal, uni);
+      else rtVal = Math.max(rtVal, uni);
+    }
+  }
+
+  // Switch raw: A=btn1, B=btn0, +=btn9. Standard mapping already remaps faces to Xbox order.
+  const confirm = (nintend && rawMap) ? (b1.pressed || b0.pressed) : (b0.pressed || b1.pressed);
+  const cancel = (nintend && rawMap) ? b0.pressed : b1.pressed;
+  const start = padButton(gp, 9).pressed || padButton(gp, 11).pressed;
+  const back = padButton(gp, 8).pressed || padButton(gp, 10).pressed;
+
+  // Throttle: RT/ZR, A/B face, OR stick forward (fallback if browser hides triggers)
+  const thrust = rtVal > 0.12 || confirm || stickY < -0.35;
+  const brakeDown = ltVal > 0.35 || stickY > 0.5;
+  const boost = b2.pressed || b3.pressed; // X/Y or Y/X
+  const airL = lSh.pressed;
+  const airR = rSh.pressed;
+
+  if (Math.abs(steer) > 0.2 || thrust || brakeDown || airL || airR || boost || confirm || start || dL || dR) {
+    padLastActivityMs = performance.now();
+  }
+
+  return {
+    id: gp.id,
+    steer,
+    thrust,
+    brakeDown,
+    boost,
+    a: confirm,
+    b: cancel,
+    x: b2.pressed,
+    y: b3.pressed,
+    start,
+    back,
+    left: dL || steer < -0.5,
+    right: dR || steer > 0.5,
+    up: dU || stickY < -0.7,
+    down: dD || stickY > 0.7,
+    lb: airL,
+    rb: airR,
+  };
+}
+
+function readPadRaw(player) {
+  return decodePad(gamepadForPlayer(player));
+}
+
+function refreshPadCount() {
+  refreshPadSlots();
+}
+
+window.addEventListener('gamepadconnected', (e) => {
+  refreshPadSlots();
+  padLastActivityMs = performance.now();
+  console.info('[pad] connected', e.gamepad?.index, e.gamepad?.id, e.gamepad?.mapping);
+});
+window.addEventListener('gamepaddisconnected', (e) => {
+  refreshPadSlots();
+  console.info('[pad] disconnected', e.gamepad?.index, e.gamepad?.id);
+});
+// Browsers only expose pads after a gesture on the page — re-scan on any input
+window.addEventListener('pointerdown', () => refreshPadSlots(), { passive: true });
+window.addEventListener('keydown', () => refreshPadSlots(), { passive: true });
+
+window.addEventListener('keydown', (e) => {
+  const maps = CONFIG.input;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  if (!e.repeat && e.code === maps.debugToggle) state.showDebug = !state.showDebug;
+  if (!e.repeat && e.code === maps.debugFrames) window.__debugGroupVisible = !window.__debugGroupVisible;
+  if (!e.repeat && state.phase === 'racing') checkAirbrakeDoubleTap(e.code);
+  if (!e.repeat && typeof onMenuKeyDown === 'function') onMenuKeyDown(e.code);
+  heldKeys.add(e.code);
+});
+window.addEventListener('keyup', (e) => heldKeys.delete(e.code));
+
+/* ---- MOBILE TOUCH: L/R airbrakes, fixed forward thrust, swipe-up boost ---- */
+const isMobile = (() => {
+  if (/(?:\?|&)mobile=1(?:&|$)/.test(location.search || '')) return true;
+  try {
+    if (matchMedia('(pointer: coarse)').matches) return true;
+    if (navigator.maxTouchPoints > 0 && matchMedia('(hover: none)').matches) return true;
+  } catch { /* */ }
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+})();
+const touchCtl = {
+  left: false,
+  right: false,
+  boostUntil: 0,
+  pointers: new Map(), // pointerId -> { x0,y0,x,y,t0,side }
+};
+let mobileTouchLayer = null, mobileHintEl = null, touchZoneL = null, touchZoneR = null, touchBoostFlash = null;
+
+function touchSideFromX(clientX) {
+  const mid = window.innerWidth * 0.5;
+  return clientX < mid ? 'left' : 'right';
+}
+function refreshTouchAirbrakes() {
+  let L = false, R = false;
+  for (const p of touchCtl.pointers.values()) {
+    if (p.side === 'left') L = true;
+    if (p.side === 'right') R = true;
+  }
+  const m = CONFIG.input.p1;
+  if (!touchCtl.left && L && typeof state !== 'undefined' && state.phase === 'racing') checkAirbrakeDoubleTap(m.brakeL);
+  if (!touchCtl.right && R && typeof state !== 'undefined' && state.phase === 'racing') checkAirbrakeDoubleTap(m.brakeR);
+  touchCtl.left = L;
+  touchCtl.right = R;
+  if (touchZoneL) touchZoneL.classList.toggle('on', L);
+  if (touchZoneR) touchZoneR.classList.toggle('on', R);
+}
+function fireMobileBoost() {
+  touchCtl.boostUntil = performance.now() + CONFIG.input.mobileBoostMs;
+  if (touchBoostFlash) {
+    touchBoostFlash.classList.add('on');
+    clearTimeout(touchBoostFlash._t);
+    touchBoostFlash._t = setTimeout(() => touchBoostFlash.classList.remove('on'), CONFIG.input.mobileBoostMs);
+  }
+}
+function setupMobileTouch() {
+  mobileTouchLayer = document.getElementById('mobile-touch-layer');
+  mobileHintEl = document.getElementById('mobile-hint');
+  touchZoneL = document.getElementById('touch-zone-l');
+  touchZoneR = document.getElementById('touch-zone-r');
+  touchBoostFlash = document.getElementById('touch-boost-flash');
+  if (!isMobile) return;
+  if (mobileHintEl) mobileHintEl.style.display = 'block';
+  document.body.classList.add('is-mobile');
+
+  const onDown = (e) => {
+    // Let UI buttons receive clicks; only capture touches on the game canvas / empty chrome
+    if (e.target && e.target.closest && e.target.closest('button,a,[data-action],input')) return;
+    if (typeof state !== 'undefined' && state.phase === 'select') return; // menu uses buttons
+    e.preventDefault();
+    const side = touchSideFromX(e.clientX);
+    touchCtl.pointers.set(e.pointerId, {
+      x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY,
+      t0: performance.now(), side,
+    });
+    refreshTouchAirbrakes();
+    try { e.target.setPointerCapture?.(e.pointerId); } catch { /* */ }
+  };
+  const onMove = (e) => {
+    const p = touchCtl.pointers.get(e.pointerId);
+    if (!p) return;
+    e.preventDefault();
+    p.x = e.clientX; p.y = e.clientY;
+    // Allow finger to slide across midline → reassign airbrake side
+    p.side = touchSideFromX(e.clientX);
+    refreshTouchAirbrakes();
+    // Swipe-up mid-gesture (also checked on release)
+    const dy = p.y0 - p.y;
+    const dx = Math.abs(p.x - p.x0);
+    if (dy >= CONFIG.input.mobileSwipeMinPx && dx < dy * 0.85 && performance.now() - p.t0 <= CONFIG.input.mobileSwipeMaxMs) {
+      if (!p.boosted) { p.boosted = true; fireMobileBoost(); }
+    }
+  };
+  const onUp = (e) => {
+    const p = touchCtl.pointers.get(e.pointerId);
+    if (!p) return;
+    e.preventDefault();
+    const dy = p.y0 - e.clientY;
+    const dx = Math.abs(e.clientX - p.x0);
+    const dt = performance.now() - p.t0;
+    if (!p.boosted && dy >= CONFIG.input.mobileSwipeMinPx && dx < dy * 0.9 && dt <= CONFIG.input.mobileSwipeMaxMs) {
+      fireMobileBoost();
+    }
+    touchCtl.pointers.delete(e.pointerId);
+    refreshTouchAirbrakes();
+  };
+
+  window.addEventListener('pointerdown', onDown, { passive: false });
+  window.addEventListener('pointermove', onMove, { passive: false });
+  window.addEventListener('pointerup', onUp, { passive: false });
+  window.addEventListener('pointercancel', onUp, { passive: false });
+  // Block page scroll / pinch while racing
+  window.addEventListener('gesturestart', (e) => e.preventDefault());
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      touchCtl.pointers.clear();
+      refreshTouchAirbrakes();
+    }
+  });
+}
+setupMobileTouch();
+
+function updateMobileChrome() {
+  if (!isMobile) return;
+  const racing = typeof state !== 'undefined' && (state.phase === 'racing' || state.phase === 'countdown');
+  if (mobileTouchLayer) mobileTouchLayer.style.display = racing ? 'block' : 'none';
+  if (mobileHintEl) {
+    mobileHintEl.style.display = (typeof state !== 'undefined' && state.phase === 'select') ? 'block' : (racing ? 'none' : 'none');
+  }
+  if (controlsEl) controlsEl.style.display = 'none';
+}
+
+function inputFor(player) {
+  const m = player === 0 ? CONFIG.input.p1 : CONFIG.input.p2;
+  // Mobile 1P: fixed forward thrust, L/R touch = airbrakes, swipe up = boost (no steer keys)
+  if (isMobile && player === 0) {
+    const boosting = performance.now() < touchCtl.boostUntil;
+    return {
+      thrust: true,
+      brakeDown: false,
+      left: false,
+      right: false,
+      steerAnalog: 0,
+      brakeL: touchCtl.left,
+      brakeR: touchCtl.right,
+      boost: boosting,
+    };
+  }
+  const pad = readPadRaw(player);
+  let steerPad = 0, thrustPad = false, brakePad = false, bLPad = false, bRPad = false, boostPad = false;
+  if (pad) {
+    steerPad = pad.steer;
+    thrustPad = pad.thrust;
+    brakePad = pad.brakeDown;
+    bLPad = pad.lb;
+    bRPad = pad.rb;
+    boostPad = pad.boost;
+    const prev = padPrev[player];
+    if (!prev.lb && bLPad) checkAirbrakeDoubleTap(m.brakeL);
+    if (!prev.rb && bRPad) checkAirbrakeDoubleTap(m.brakeR);
+    prev.lb = bLPad; prev.rb = bRPad;
+  } else {
+    padPrev[player].lb = false; padPrev[player].rb = false;
+  }
+  return {
+    thrust: heldKeys.has(m.up) || thrustPad,
+    brakeDown: heldKeys.has(m.down) || brakePad,
+    left: heldKeys.has(m.left),
+    right: heldKeys.has(m.right),
+    steerAnalog: steerPad,
+    brakeL: heldKeys.has(m.brakeL) || bLPad,
+    brakeR: heldKeys.has(m.brakeR) || bRPad,
+    boost: heldKeys.has(m.boost) || (player === 0 && heldKeys.has('Space')) || boostPad,
+  };
+}
+
+/* Menu / overlay actions from gamepad rising edges (1st pad → P1, 2nd → P2). */
+function pollGamepadMenu() {
+  refreshPadSlots();
+  const inMenu = state.phase === 'select' || state.phase === 'finished';
+  for (let p = 0; p < 2; p++) {
+    const pad = readPadRaw(p);
+    const prev = padPrev[p];
+    if (!pad) {
+      prev.a = prev.b = prev.start = prev.back = prev.left = prev.right = prev.up = false;
+      continue;
+    }
+    const edge = (key, now) => { const hit = now && !prev[key]; prev[key] = !!now; return hit; };
+    const leftHit = edge('left', pad.left);
+    const rightHit = edge('right', pad.right);
+    const aHit = edge('a', pad.a);
+    const upHit = edge('up', pad.up);
+    const startHit = edge('start', pad.start);
+    const bHit = edge('b', pad.b);
+    const backHit = edge('back', pad.back);
+    if (!inMenu) continue;
+    if (state.phase === 'select') {
+      if (leftHit || rightHit) {
+        state.picks[p] = state.picks[p] === 'volt' ? 'arc' : 'volt';
+        state.ready[p] = false;
+        rebuildShowroomMeshes(); renderSelectUI();
+      }
+      if (aHit || upHit) {
+        state.ready[p] = true;
+        if (isGhostMode()) {
+          beginCountdown();
+        } else {
+          if (padsConnected < 2) state.ready[1 - p] = true;
+          if (state.ready[0] && state.ready[1]) beginCountdown();
+          else renderSelectUI();
+        }
+      }
+      if (startHit) beginCountdown();
+    } else if (state.phase === 'finished') {
+      if (aHit || startHit) beginCountdown();
+      if (bHit || backHit) openShipSelect();
+    }
+  }
+}
+
+/* ============================================================ TRACK ===== */
+/* Phase 2 builds the swept mesh + 2000-sample lookup table. Phase 1 only   */
+/* draws a placeholder centre-line so split-screen framing is visible.      */
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(CONFIG.render.fogColor, CONFIG.render.fogNear, CONFIG.render.fogFar);
+
+// Golden-hour lighting: warm low sun + soft dusk fill (neon track still pops against amber haze)
+const hemiLight = new THREE.HemisphereLight('#ffd2a8', '#2a1824', CONFIG.render.hemisphereIntensity);
+scene.add(hemiLight);
+const keyLight = new THREE.DirectionalLight('#ffc078', 1.55);
+keyLight.position.set(-90, 35, -40); // low sun on the horizon
+scene.add(keyLight);
+const rimLight = new THREE.DirectionalLight('#8aa0d8', 0.55);
+rimLight.position.set(70, 40, 120);
+scene.add(rimLight);
+const sunFill = new THREE.DirectionalLight('#ff8a4a', 0.35);
+sunFill.position.set(-40, 8, 20);
+scene.add(sunFill);
+
+// Golden-hour skybox: peach zenith fade, hot horizon, low sun disc (fog-exempt)
+const skyDome = new THREE.Mesh(
+  new THREE.SphereGeometry(900, 64, 32),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      zenith: { value: new THREE.Color('#6b7fb8') },
+      midSky: { value: new THREE.Color('#f0b888') },
+      horizon: { value: new THREE.Color('#ff9a4a') },
+      sunCore: { value: new THREE.Color('#fff6d8') },
+      ground: { value: new THREE.Color('#2a1520') },
+      sunDir: { value: new THREE.Vector3(-0.78, 0.08, -0.22).normalize() },
+    },
+    vertexShader: `
+      varying vec3 vDir;
+      void main(){
+        // Camera-locked dome: always surrounds the view without parallax pop
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform vec3 zenith, midSky, horizon, sunCore, ground, sunDir;
+      varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        float h = d.y;
+        // Multi-stop golden hour gradient
+        vec3 col = mix(ground, horizon, smoothstep(-0.35, 0.02, h));
+        col = mix(col, midSky, smoothstep(0.02, 0.28, h));
+        col = mix(col, zenith, smoothstep(0.22, 0.95, h));
+        // Huge warm corona + tight sun disc on the horizon
+        float align = max(0.0, dot(d, normalize(sunDir)));
+        col += sunCore * pow(align, 220.0) * 2.2;
+        col += vec3(1.0, 0.72, 0.35) * pow(align, 12.0) * 0.7;
+        col += vec3(1.0, 0.55, 0.25) * pow(align, 3.0) * 0.35;
+        // Horizon light wrap
+        col += vec3(1.0, 0.45, 0.2) * exp(-abs(h - 0.02) * 14.0) * 0.28;
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  })
+);
+skyDome.renderOrder = -10;
+skyDome.frustumCulled = false;
+scene.add(skyDome);
+
+function makeAsphaltTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const ctx = c.getContext('2d');
+  // Rich slate-blue sci-fi track deck with crisp lane markings & chevron ticks
+  ctx.fillStyle = '#1e2c46';
+  ctx.fillRect(0, 0, 256, 256);
+  // Subtle racing groove bands
+  ctx.fillStyle = '#263858';
+  ctx.fillRect(42, 0, 56, 256);
+  ctx.fillRect(158, 0, 56, 256);
+  // Outer shoulder stripes
+  ctx.fillStyle = '#38bdf8';
+  ctx.fillRect(12, 0, 5, 256);
+  ctx.fillStyle = '#e879f9';
+  ctx.fillRect(239, 0, 5, 256);
+  // Transverse armor plate joints
+  ctx.fillStyle = '#141e32';
+  for (let y = 0; y < 256; y += 64) ctx.fillRect(0, y, 256, 4);
+  // Dashed glowing center line
+  ctx.fillStyle = '#7dd3fc';
+  ctx.fillRect(125, 16, 6, 92);
+  ctx.fillRect(125, 144, 6, 92);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.generateMipmaps = true;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = 16;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function makeChevronTexture(hexCol) {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 256;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = 'rgba(6, 20, 28, 0.85)';
+  ctx.fillRect(0, 0, 128, 256);
+  ctx.strokeStyle = hexCol;
+  ctx.lineWidth = 8;
+  ctx.strokeRect(4, 4, 120, 248);
+  ctx.fillStyle = hexCol;
+  for (const yOff of [42, 118, 194]) {
+    ctx.beginPath();
+    ctx.moveTo(20, yOff + 36);
+    ctx.lineTo(64, yOff - 12);
+    ctx.lineTo(108, yOff + 36);
+    ctx.lineTo(92, yOff + 48);
+    ctx.lineTo(64, yOff + 16);
+    ctx.lineTo(36, yOff + 48);
+    ctx.closePath();
+    ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+const roadMat = new THREE.MeshStandardMaterial({
+  color: '#c8daf8',
+  map: makeAsphaltTexture(),
+  roughness: 0.42,
+  metalness: 0.25,
+  envMapIntensity: 0.22,
+});
+/* Lookup table — the single source of truth for all physics queries.        */
+const trackTable = [];          // {pos,tangent,up,right,bank,dist}; window.trackTable exposed below
+let trackCurve = null;
+let trackGroup = null;
+
+function disposeGroup(grp) {
+  if (!grp) return;
+  scene.remove(grp);
+  grp.traverse(obj => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material && obj.material !== roadMat) {
+      if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+      else obj.material.dispose();
+    }
+  });
+}
+
+function orientFlatOnTrack(mesh, sample) {
+  // PlaneGeometry lies in local XY (+Z normal). Build basis: X = right, Y = tangent, Z = up so quad sits flat on road.
+  const m = new THREE.Matrix4().makeBasis(sample.right, sample.tangent, sample.up);
+  mesh.quaternion.setFromRotationMatrix(m);
+}
+
+function bankAt(t) {
+  // Banking is a CLOSED profile: the control keys are fractions of arc length around the loop, so the segment that
+  // runs from the last key back to the first crosses t = 1 / t = 0. The old version fell back on an extrapolation
+  // past the outer keys (bankAt(0.9995) gave -0.97 rad and bankAt(0) gave +0.93 rad), which rolled the road over by
+  // ~109 degrees across the start line — that was literally the "track is not joined just before the start" artifact.
+  const keys = CONFIG.track.bankKeys;
+  if (!keys.length) return 0;
+  const n = keys.length;
+  for (let i = 0; i < n - 1; i++) {                                // interior segments
+    if (t >= keys[i].t && t <= keys[i+1].t) {
+      const a = keys[i], b = keys[i+1], span = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
+      return a.bank + (b.bank - a.bank) * span;
+    }
+  }
+  const last = keys[n-1], first = keys[0];                        // wrap segment: last key -> first key (+1), across the seam
+  const aT = last.t, bT = first.t + 1;
+  const tt = t < first.t ? t + 1 : t;                             // pull low-side samples onto the wrapped side
+  if (tt >= aT && tt <= bT) {
+    const span = bT === aT ? 0 : (tt - aT) / (bT - aT);
+    return last.bank + (first.bank - last.bank) * span;
+  }
+  return first.bank;                                              // single key or exact key: no extrapolation ever
+}
+
+function buildTrack() {
+  disposeGroup(trackGroup);
+  disposeLegoProps();
+  trackGroup = new THREE.Group();
+  scene.add(trackGroup);
+  trackTable.length = 0;
+
+  const T = CONFIG.track, N = T.samples;
+  trackCurve = new THREE.CatmullRomCurve3(T.points.map(p => new THREE.Vector3(...p)), true);
+
+  // ---- rotation-minimising frames for a CLOSED loop ---------------------------------------
+  const rawTan = new Array(N).fill(null);
+  for (let i = 0; i < N; i++) {                                   // central difference, wrapping past the start line
+    const a = trackCurve.getPointAt((((i - 1) + N) % N) / N), b = trackCurve.getPointAt(((i + 1) % N) / N);
+    rawTan[i] = b.clone().sub(a).normalize();
+  }
+  const rawUp = new Array(N).fill(null);
+  {                                                              // seed: world-up projected off the first tangent
+    let u = new THREE.Vector3(0, 1, 0).projectOnPlane(rawTan[0]);
+    if (u.lengthSq() < 1e-6) u = new THREE.Vector3(0, 0, 1).projectOnPlane(rawTan[0]);
+    rawUp[0] = u.normalize();
+  }
+  const swing = (up, fromT, toT) => {                            // minimal rotation that carries one tangent onto the next
+    const axis = new THREE.Vector3().crossVectors(fromT, toT);
+    if (axis.lengthSq() > 1e-10) up.applyAxisAngle(axis.normalize(), Math.min(Math.PI, fromT.angleTo(toT)));
+    return up.projectOnPlane(toT).normalize();                   // stays exactly perpendicular to the new tangent
+  };
+  for (let i = 1; i < N; i++) rawUp[i] = swing(rawUp[i - 1].clone(), rawTan[i - 1], rawTan[i]);
+
+  const carried = swing(rawUp[N - 1].clone(), rawTan[N - 1], rawTan[0]);   // last frame stepped back onto the start line
+  let seamTwist = Math.atan2(new THREE.Vector3().crossVectors(carried, rawUp[0]).dot(rawTan[0]), carried.dot(rawUp[0]));
+  while (seamTwist > Math.PI) seamTwist -= 2 * Math.PI;
+  while (seamTwist < -Math.PI) seamTwist += 2 * Math.PI;
+
+  let dist = 0;
+  for (let i = 0; i <= N; i++) {                                   // final lookup table from the corrected frames
+    const t = i / N;
+    const pos = i === N ? trackTable[0].pos.clone() : trackCurve.getPointAt(t);   // closing sample == start line, exactly
+    const tan = rawTan[i % N].clone();
+    const bank = bankAt(i === N ? 0 : t);
+    const baseUp = (i === N) ? carried : rawUp[i % N];
+    const up = baseUp.clone()
+      .applyAxisAngle(tan, seamTwist * (i / N))                    // untwist spread over the whole loop, never on one quad
+      .applyAxisAngle(tan, bank)                                   // banking last keeps handedness consistent everywhere
+      .projectOnPlane(tan).normalize();                            // re-orthogonalise after the two rolls
+    const right = new THREE.Vector3().crossVectors(tan, up).normalize();       // right = tangent × up
+    if (i > 0) dist += trackTable[i-1].pos.distanceTo(pos);
+    trackTable.push({ pos, tangent: tan, up, right, bank, dist });
+  }
+
+  window.trackTable = trackTable;
+  window.__seamTwist = seamTwist;
+
+  // Swept road + walls with SHARED smooth vertex normals along the ribbon.
+  const hw = T.roadHalfWidth, wallH = T.wallHeight;
+  const inGapT = (t) => t >= T.jumpGap[0] && t <= T.jumpGap[1];
+
+  // Per-sample curvature (rad/m) — drives road + rail color on tight bends
+  const curv = new Float32Array(N + 1);
+  for (let i = 0; i < N; i++) {
+    const a = trackTable[i], b = trackTable[i + 1];
+    const seg = Math.max(0.05, a.pos.distanceTo(b.pos));
+    curv[i] = a.tangent.angleTo(b.tangent) / seg;
+  }
+  curv[N] = curv[0];
+  const tightK = T.railTightCurvature;
+  function tightBlend(i) {
+    // Smoothstep so medium bends tint and hairpins go fully amber
+    const x = Math.min(1, Math.max(0, curv[i] / tightK));
+    return x * x * (3 - 2 * x);
+  }
+
+  const rPos = new Float32Array((N + 1) * 2 * 3);
+  const rNrm = new Float32Array((N + 1) * 2 * 3);
+  const rUvs = new Float32Array((N + 1) * 2 * 2);
+  const rCol = new Float32Array((N + 1) * 2 * 3);
+  const rIdx = [];
+  const roadOpen = new THREE.Color(T.roadOpen);
+  const roadTight = new THREE.Color(T.roadTight);
+  const roadTint = new THREE.Color();
+  for (let i = 0; i <= N; i++) {
+    const a = trackTable[i];
+    const lx = a.pos.x - a.right.x * hw, ly = a.pos.y - a.right.y * hw, lz = a.pos.z - a.right.z * hw;
+    const rx = a.pos.x + a.right.x * hw, ry = a.pos.y + a.right.y * hw, rz = a.pos.z + a.right.z * hw;
+    const vBase = i * 6;
+    rPos[vBase] = lx; rPos[vBase + 1] = ly; rPos[vBase + 2] = lz;
+    rPos[vBase + 3] = rx; rPos[vBase + 4] = ry; rPos[vBase + 5] = rz;
+    rNrm[vBase] = a.up.x; rNrm[vBase + 1] = a.up.y; rNrm[vBase + 2] = a.up.z;
+    rNrm[vBase + 3] = a.up.x; rNrm[vBase + 4] = a.up.y; rNrm[vBase + 5] = a.up.z;
+    const uBase = i * 4;
+    rUvs[uBase] = 0; rUvs[uBase + 1] = a.dist * 0.05;
+    rUvs[uBase + 2] = 1; rUvs[uBase + 3] = a.dist * 0.05;
+    roadTint.copy(roadOpen).lerp(roadTight, tightBlend(i));
+    const cBase = i * 6;
+    rCol[cBase] = rCol[cBase + 3] = roadTint.r;
+    rCol[cBase + 1] = rCol[cBase + 4] = roadTint.g;
+    rCol[cBase + 2] = rCol[cBase + 5] = roadTint.b;
+  }
+  for (let i = 0; i < N; i++) {
+    if (inGapT(i / N) || inGapT((i + 1) / N)) continue;
+    const v0 = i * 2, v1 = v0 + 1, v2 = v0 + 2, v3 = v0 + 3;
+    rIdx.push(v0, v1, v2, v1, v3, v2);
+  }
+  const roadGeo = new THREE.BufferGeometry();
+  roadGeo.setAttribute('position', new THREE.BufferAttribute(rPos, 3));
+  roadGeo.setAttribute('normal', new THREE.BufferAttribute(rNrm, 3));
+  roadGeo.setAttribute('uv', new THREE.BufferAttribute(rUvs, 2));
+  roadGeo.setAttribute('color', new THREE.BufferAttribute(rCol, 3));
+  roadGeo.setIndex(rIdx);
+  // Clone asphalt: brighten the map so warm vertex tints stay readable (dark slate map was crushing amber to mud)
+  const roadMatCurved = roadMat.clone();
+  roadMatCurved.vertexColors = true;
+  roadMatCurved.color.set('#ffffff');
+  roadMatCurved.map = roadMat.map.clone();
+  roadMatCurved.map.colorSpace = THREE.SRGBColorSpace;
+  // Bake a lighter asphalt atlas so open=cool slate, tight=amber still pops through the map multiply
+  {
+    const src = document.createElement('canvas');
+    src.width = 256; src.height = 256;
+    const img = roadMat.map.image;
+    const ctx = src.getContext('2d');
+    if (img) {
+      ctx.drawImage(img, 0, 0);
+      const id = ctx.getImageData(0, 0, 256, 256);
+      const d = id.data;
+      for (let p = 0; p < d.length; p += 4) {
+        // Lift midtones ~1.55× so vertex amber isn't crushed
+        d[p] = Math.min(255, d[p] * 1.55 + 18);
+        d[p + 1] = Math.min(255, d[p + 1] * 1.55 + 14);
+        d[p + 2] = Math.min(255, d[p + 2] * 1.45 + 10);
+      }
+      ctx.putImageData(id, 0, 0);
+    }
+    roadMatCurved.map.image = src;
+    roadMatCurved.map.needsUpdate = true;
+  }
+  const roadMesh = new THREE.Mesh(roadGeo, roadMatCurved);
+  roadMesh.name = 'road';
+  trackGroup.add(roadMesh);
+
+  // Bright amber center ribbon on tight bends — unmistakable even with fog/bloom
+  {
+    const bandPos = [], bandCol = [], bandInd = [];
+    let bi = 0;
+    const amber = new THREE.Color('#ff9a2a').multiplyScalar(1.6);
+    const cool = new THREE.Color('#1a2438');
+    const bcA = new THREE.Color(), bcB = new THREE.Color();
+    const halfBand = 2.4;
+    for (let i = 0; i < N; i++) {
+      if (inGapT(i / N) || inGapT((i + 1) / N)) continue;
+      const blendA = tightBlend(i), blendB = tightBlend(i + 1);
+      if (blendA < 0.2 && blendB < 0.2) continue;
+      const a = trackTable[i], b = trackTable[i + 1];
+      bcA.copy(cool).lerp(amber, blendA);
+      bcB.copy(cool).lerp(amber, blendB);
+      const A0 = a.pos.clone().addScaledVector(a.right, -halfBand).addScaledVector(a.up, 0.05);
+      const A1 = a.pos.clone().addScaledVector(a.right, halfBand).addScaledVector(a.up, 0.05);
+      const B0 = b.pos.clone().addScaledVector(b.right, -halfBand).addScaledVector(b.up, 0.05);
+      const B1 = b.pos.clone().addScaledVector(b.right, halfBand).addScaledVector(b.up, 0.05);
+      bandPos.push(A0.x, A0.y, A0.z, A1.x, A1.y, A1.z, B0.x, B0.y, B0.z, B1.x, B1.y, B1.z);
+      bandCol.push(bcA.r, bcA.g, bcA.b, bcA.r, bcA.g, bcA.b, bcB.r, bcB.g, bcB.b, bcB.r, bcB.g, bcB.b);
+      bandInd.push(bi, bi + 1, bi + 2, bi + 1, bi + 3, bi + 2);
+      bi += 4;
+    }
+    if (bandPos.length) {
+      const bg = new THREE.BufferGeometry();
+      bg.setAttribute('position', new THREE.Float32BufferAttribute(bandPos, 3));
+      bg.setAttribute('color', new THREE.Float32BufferAttribute(bandCol, 3));
+      bg.setIndex(bandInd);
+      trackGroup.add(new THREE.Mesh(bg, new THREE.MeshBasicMaterial({
+        vertexColors: true, transparent: true, opacity: 0.82, depthWrite: false, side: THREE.DoubleSide,
+      })));
+    }
+  }
+
+  // Low side walls extruded along local frame up + bright NEON border rails (cyan left, magenta right)
+  const wallMat = new THREE.MeshStandardMaterial({
+    color: '#1b2b48', roughness: 0.35, metalness: 0.55,
+    emissive: '#0e1b36', emissiveIntensity: 0.9, side: THREE.DoubleSide,
+  });
+  const wGeo = new THREE.BufferGeometry();
+  let wi2 = 0;
+  const wPos = [], wInd = [];
+  for (let i = 0; i < N; i++) {
+    if (inGapT(i / N) || inGapT((i + 1) / N)) continue;
+    const a = trackTable[i], b = trackTable[i + 1];
+    for (const side of [1, -1]) {
+      const A0 = a.pos.clone().addScaledVector(a.right, side * hw);
+      const B0 = b.pos.clone().addScaledVector(b.right, side * hw);
+      const A1 = A0.clone().addScaledVector(a.up, wallH);
+      const B1 = B0.clone().addScaledVector(b.up, wallH);
+      wPos.push(A0.x, A0.y, A0.z, A1.x, A1.y, A1.z, B0.x, B0.y, B0.z, B1.x, B1.y, B1.z);
+      if (side > 0) wInd.push(wi2, wi2 + 2, wi2 + 1, wi2 + 1, wi2 + 2, wi2 + 3);
+      else          wInd.push(wi2, wi2 + 1, wi2 + 2, wi2 + 1, wi2 + 3, wi2 + 2);
+      wi2 += 4;
+    }
+  }
+  wGeo.setAttribute('position', new THREE.Float32BufferAttribute(wPos, 3));
+  wGeo.setIndex(wInd);
+  wGeo.computeVertexNormals();
+  trackGroup.add(new THREE.Mesh(wGeo, wallMat));
+
+  const colOpenL = new THREE.Color(T.railOpenL).multiplyScalar(1.45);
+  const colOpenR = new THREE.Color(T.railOpenR).multiplyScalar(1.45);
+  const colTight = new THREE.Color(T.railTight).multiplyScalar(1.7);
+  function railColorAt(i, side, out) {
+    const open = side < 0 ? colOpenL : colOpenR;
+    return out.copy(open).lerp(colTight, tightBlend(i));
+  }
+  const cA = new THREE.Color(), cB = new THREE.Color();
+
+  // Neon border ribbons — open cyan/magenta, tighter curves → bright amber
+  for (const side of [-1, 1]) {
+    const railPos = [], railCol = [], railInd = [];
+    let ri = 0;
+    for (let i = 0; i < N; i++) {
+      if (inGapT(i / N) || inGapT((i + 1) / N)) continue;
+      const a = trackTable[i], b = trackTable[i + 1];
+      railColorAt(i, side, cA);
+      railColorAt(i + 1, side, cB);
+      for (const [hOff, rInward, thick] of [[wallH, 0.0, 0.28], [0.06, -side * 0.22, 0.34]]) {
+        const pA0 = a.pos.clone().addScaledVector(a.right, side * hw + rInward).addScaledVector(a.up, hOff);
+        const pA1 = pA0.clone().addScaledVector(a.right, -side * thick);
+        const pB0 = b.pos.clone().addScaledVector(b.right, side * hw + rInward).addScaledVector(b.up, hOff);
+        const pB1 = pB0.clone().addScaledVector(b.right, -side * thick);
+        railPos.push(pA0.x, pA0.y, pA0.z, pA1.x, pA1.y, pA1.z, pB0.x, pB0.y, pB0.z, pB1.x, pB1.y, pB1.z);
+        railCol.push(cA.r, cA.g, cA.b, cA.r, cA.g, cA.b, cB.r, cB.g, cB.b, cB.r, cB.g, cB.b);
+        railInd.push(ri, ri + 1, ri + 2, ri + 1, ri + 3, ri + 2);
+        ri += 4;
+      }
+    }
+    const rg = new THREE.BufferGeometry();
+    rg.setAttribute('position', new THREE.Float32BufferAttribute(railPos, 3));
+    rg.setAttribute('color', new THREE.Float32BufferAttribute(railCol, 3));
+    rg.setIndex(railInd);
+    const rm = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    trackGroup.add(new THREE.Mesh(rg, rm));
+  }
+
+  // Flat launch marker on the ramp (no vertical end-cap walls — those blocked the jump)
+  const rampIdx = Math.max(0, Math.floor(T.jumpGap[0] * N) - 1);
+  const rf = trackTable[rampIdx];
+  const rampBar = new THREE.Mesh(
+    new THREE.PlaneGeometry(hw * 2, 1.4),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color('#ffbe0b').multiplyScalar(1.4), side: THREE.DoubleSide })
+  );
+  orientFlatOnTrack(rampBar, rf);
+  rampBar.position.copy(rf.pos).addScaledVector(rf.up, 0.06);
+  trackGroup.add(rampBar);
+
+  // Start/finish checkered neon banner + glowing chevron boost pads
+  const sIdx = Math.round(T.startLineT * N);
+  const sl = new THREE.Mesh(
+    new THREE.PlaneGeometry(hw * 2 - 0.6, 1.8),
+    new THREE.MeshBasicMaterial({ color: '#c8ecff', side: THREE.DoubleSide })
+  );
+  sl.position.copy(trackTable[sIdx].pos).addScaledVector(trackTable[sIdx].up, 0.045);
+  orientFlatOnTrack(sl, trackTable[sIdx]);
+  trackGroup.add(sl);
+
+  const chevTex = makeChevronTexture('#28ffc8');
+  for (const bt of T.boostPadsT) {
+    const i = Math.round(bt * N); if (inGapT(bt)) continue;
+    const s2 = trackTable[i];
+    const pad = new THREE.Mesh(
+      new THREE.PlaneGeometry(T.padAcross, T.padLenAlong),
+      new THREE.MeshBasicMaterial({
+        map: chevTex,
+        color: new THREE.Color('#40ffd0').multiplyScalar(1.8),
+        transparent: true,
+        side: THREE.DoubleSide,
+      })
+    );
+    orientFlatOnTrack(pad, s2);
+    pad.position.copy(s2.pos).addScaledVector(s2.up, 0.055);
+    trackGroup.add(pad);
+  }
+
+  // Debug frame view (F2): axes every `frameDebugStep` samples — OFF by default for normal players
+  const dg = new THREE.Group();
+  for (let i = 0; i < trackTable.length - 1; i += CONFIG.track.frameDebugStep) {
+    const f = trackTable[i];
+    for (const [col, vec] of [['#ff5c8a', f.tangent], ['#63e7ff', f.up], ['#ffd24d', f.right]]) {
+      const g = new THREE.BufferGeometry().setFromPoints([f.pos.clone(), f.pos.clone().addScaledVector(vec, 3)]);
+      dg.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: col })));
+    }
+  }
+  if (window.__debugGroupVisible === undefined) window.__debugGroupVisible = false;
+  dg.visible = !!window.__debugGroupVisible;
+  trackGroup.add(dg);
+  window.__updateDebugVisibility = () => { dg.visible = !!window.__debugGroupVisible; };
+
+  // Soft dusk ground disc (no wire grid — fog + golden hour need a calm horizon bed)
+  const ground = new THREE.Mesh(
+    new THREE.CircleGeometry(CONFIG.render.gridSize * 0.55, 48),
+    new THREE.MeshBasicMaterial({ color: '#2a1a22', fog: true, depthWrite: false })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = CONFIG.render.gridY;
+  ground.renderOrder = -5;
+  trackGroup.add(ground);
+
+  buildLegoProps(); // interactive LEGO crates / towers / studs on the racing line
+}
+
+/* ============================================================ SHIP PHYSICS == */
+/* Zero-allocation scratch vectors & quaternions reused in the 120 Hz loop.  */
+const S1 = new THREE.Vector3(), S2 = new THREE.Vector3(), S3 = new THREE.Vector3();
+const S4 = new THREE.Vector3(), S5 = new THREE.Vector3(), WORLD_UP = new THREE.Vector3(0, 1, 0);
+const Q1 = new THREE.Quaternion(), Q2 = new THREE.Quaternion(), M4 = new THREE.Matrix4();
+
+function spawnPose(player) {
+  const i = Math.round(CONFIG.track.startLineT * CONFIG.track.samples);
+  const f = trackTable[i];
+  const pos = f.pos.clone().addScaledVector(f.right, CONFIG.track.lanes[player]).addScaledVector(f.up, CONFIG.ships.hoverHeight);
+  return { idx: i, frame: f, pos };
+}
+
+function makeShip(player, shipType) {
+  const sp = spawnPose(player);
+  const type = shipType || CONFIG.ships.shipPickDefault;
+  const s = {
+    player,
+    type,
+    pos: sp.pos.clone(),
+    prevPos: sp.pos.clone(),
+    velocity: new THREE.Vector3(0, 0, 0),
+    heading: 0, prevHeading: 0,
+    onGround: true, prevOnGround: true,
+    forward: sp.frame.tangent.clone(),
+    up: sp.frame.up.clone(),
+    prevForward: sp.frame.tangent.clone(),
+    prevUp: sp.frame.up.clone(),
+    prevTangent: sp.frame.tangent.clone(),
+    trackIdx: sp.idx,
+    distAlong: sp.frame.dist,
+    lane: CONFIG.track.lanes[player],
+    height: CONFIG.ships.hoverHeight,
+    visualRoll: 0, visualPitch: 0, prevVisualRoll: 0, prevVisualPitch: 0,
+    boostEnergy: CONFIG.ships.maxEnergy * CONFIG.ships.energyStartFrac,
+    shield: CONFIG.ships.maxShield,
+    laneVel: 0, normalVel: 0, forwardVel: 0,
+    effTop: CONFIG.ships.shipTypes[type].topSpeed,
+    drifting: false,
+    driftStreakSec: 0,
+    lastValidIdx: sp.idx,
+    lastValidLane: CONFIG.track.lanes[player],
+    fellAt: 0,
+    lastPadAt: -1e9,
+    lastSideshiftAt: -1e9,
+    sideshiftUntil: 0,
+    respawnPenaltyUntil: 0,
+    wallFlashUntil: 0,
+    legoSmashUntil: 0,
+    legoStudUntil: 0,
+    landedFlashUntil: 0,
+    perfectLandingUntil: 0,
+    shakeMag: 0,
+    lap: 0, passedMid: false, prevTrackIdx: sp.idx,
+    bestLapMs: 0, lastLapMs: 0, lapStartMs: 0, totalRaceMs: 0, finished: false, finishPlace: 0,
+    mesh: null,
+  };
+  return s;
+}
+
+function inGap(idx) {                      // same window the road mesh skips — ships fly over it freely
+  const t = idx / CONFIG.track.samples;
+  const g = CONFIG.track.jumpGap;
+  return t >= g[0] && t <= g[1];
+}
+
+function nearestIndex(ship, maxSearch) {   // local window around last known index using real 3D distance
+  const N = CONFIG.track.samples;
+  let best = ship.trackIdx, bd = Infinity;
+  for (let k = -12; k <= maxSearch; k++) {
+    const j = ((ship.trackIdx + k) % N + N) % N;
+    const sample = trackTable[j];
+    if (!sample) continue;
+    const d = sample.pos.distanceToSquared(ship.pos);
+    if (d < bd) { bd = d; best = j; }
+  }
+  return best;
+}
+
+/* Input normalization: keyboard + gamepad -> the single dict physics consumes. */
+function readInputs() {
+  for (let p = 0; p < 2; p++) {
+    const k = inputFor(p);
+    const keySteer = (k.right ? 1 : 0) - (k.left ? 1 : 0);
+    state.input[p] = {
+      steerX: keySteer !== 0 ? keySteer : (k.steerAnalog || 0),
+      throttle: k.thrust,
+      brakeDown: k.brakeDown,
+      brakeL: k.brakeL,
+      brakeR: k.brakeR,
+      boost: k.boost,
+    };
+  }
+}
+
+function wrapAngle(a) {
+  let x = a + Math.PI;
+  x -= Math.floor(x / (2 * Math.PI)) * (2 * Math.PI);
+  return x - Math.PI;
+}
+
+/* ---- SHIP PHYSICS: single unified fixed-timestep step (120 Hz). --------- */
+function stepShip(ship, dt) {
+  const st = CONFIG.ships.shipTypes[ship.type] || CONFIG.ships.shipTypes.volt;
+  const H = CONFIG.ships, P = CONFIG.physics;
+  const inp = state.input[ship.player] || {};
+
+  // Render-interpolation snapshot first
+  ship.prevPos.copy(ship.pos);
+  ship.prevHeading = ship.heading;
+  ship.prevForward.copy(ship.forward);
+  ship.prevUp.copy(ship.up);
+  ship.prevVisualRoll = ship.visualRoll;
+  ship.prevVisualPitch = ship.visualPitch;
+
+  // If currently waiting out the 1 s fall-off respawn delay, hold until respawn completes
+  if (ship.fellAt > 0) return;
+
+  const N = CONFIG.track.samples;
+  const totalDist = trackTable[N].dist;
+  const dpp = totalDist / N;
+  const maxSearch = Math.max(14, Math.ceil((ship.velocity.length() * dt) / dpp) + 14);
+
+  // Fallback global search only if teleported / displaced far from last sample
+  const pf = trackTable[ship.trackIdx];
+  if (pf && pf.pos.distanceToSquared(ship.pos) > 900) {
+    let bi = ship.trackIdx, bd = Infinity;
+    for (let j = 0; j < N; j++) {
+      const dd = trackTable[j].pos.distanceToSquared(ship.pos);
+      if (dd < bd) { bd = dd; bi = j; }
+    }
+    ship.trackIdx = bi;
+  }
+  ship.trackIdx = nearestIndex(ship, maxSearch);
+  const f = trackTable[ship.trackIdx];
+  ship.distAlong = f.dist;
+
+  // Track-relative coordinates entering this step (track frame yawed by deltaTang since last step!)
+  if (ship.prevTangent) {
+    // Keep world nose orientation continuous as track sample advances: heading is relative to f.tangent,
+    // so when the road bends right by +dRoad, relative heading shifts by -dRoad unless the player steers!
+    const dotT = Math.max(-1, Math.min(1, ship.prevTangent.dot(f.tangent)));
+    S4.crossVectors(ship.prevTangent, f.tangent);
+    const dRoad = Math.atan2(-S4.dot(f.up), dotT);
+    ship.heading = wrapAngle(ship.heading - dRoad);
+  } else {
+    ship.prevTangent = new THREE.Vector3();
+  }
+  ship.prevTangent.copy(f.tangent);
+
+  S1.copy(ship.pos).sub(f.pos);
+  ship.lane = S1.dot(f.right);
+  ship.height = S1.dot(f.up);
+
+  const overRoad = !inGap(ship.trackIdx);
+  const grounded = overRoad && ship.height <= H.maxHoverDist && ship.height >= -1.8;
+  if (grounded) {
+    ship.lastValidIdx = ship.trackIdx;
+    ship.lastValidLane = Math.max(-CONFIG.track.roadHalfWidth * 0.5, Math.min(CONFIG.track.roadHalfWidth * 0.5, ship.lane));
+  }
+
+  // ---- 1. Steering & Airbrakes (yaw relative to track frame) --------------
+  const boosting = !!(inp.boost && ship.boostEnergy > 0);
+  const effTop = st.topSpeed * (1 + (boosting ? H.boostTopSpeedBonus : 0));
+  ship.effTop = effTop;
+
+  // Nose forward F and right-side slip axis R_ship in the local track plane
+  const cosH = Math.cos(ship.heading), sinH = Math.sin(ship.heading);
+  S2.copy(f.tangent).multiplyScalar(cosH).addScaledVector(f.right, sinH).normalize(); // F (nose in track plane)
+  S3.crossVectors(S2, f.up).normalize(); // ship-right in track plane (+lane when heading=0)
+
+  // Decompose incoming world velocity into local track plane BEFORE yawing, so yawing the nose creates genuine slip!
+  const vInPlaneFwd = ship.velocity.dot(S2);
+  const vInPlaneSide = ship.velocity.dot(S3);
+  const vNorm = ship.velocity.dot(f.up);
+
+  const speedFrac = Math.max(0, Math.min(1.2, vInPlaneFwd / Math.max(1, st.topSpeed)));
+  // Yaw rate decreases at high speed (spec 4), so tight hairpins require airbrakes!
+  const steerRateEff = st.steerRate * (1 - P.steerSpeedTaper * Math.min(1, speedFrac));
+  let dh = (inp.steerX || 0) * steerRateEff * P.steerSign * dt;
+
+  const singleBrakeR = !!(inp.brakeR && !inp.brakeL);
+  const singleBrakeL = !!(inp.brakeL && !inp.brakeR);
+  const bothBrakes = !!(inp.brakeL && inp.brakeR);
+  const steerVal = inp.steerX || 0;
+  // Synergy check: same-side steer + airbrake (D+E or A+Q) vs airbrake alone vs counter-steer drift (A+E or D+Q)!
+  const comboSameSide = (singleBrakeR && steerVal > 0.15) || (singleBrakeL && steerVal < -0.15);
+  const yawMult = comboSameSide ? P.airbrakeYawGain * P.airbrakeComboYawBonus : P.airbrakeYawGain;
+
+  if (singleBrakeR) dh += st.steerRate * yawMult * P.steerSign * dt;
+  if (singleBrakeL) dh -= st.steerRate * yawMult * P.steerSign * dt;
+
+  ship.heading = wrapAngle(ship.heading + dh);
+
+  // Recompute nose F & ship-right S3 at the updated heading; project world velocity onto the new ship axes!
+  const cosH1 = Math.cos(ship.heading), sinH1 = Math.sin(ship.heading);
+  S2.copy(f.tangent).multiplyScalar(cosH1).addScaledVector(f.right, sinH1).normalize();
+  S3.crossVectors(S2, f.up).normalize();
+  let vF = ship.velocity.dot(S2);
+  let vSide = ship.velocity.dot(S3);
+
+  // Gentle velocity-alignment of heading only when no steering/airbrake is held, so ship doesn't spin forever
+  if (grounded && !steerVal && !singleBrakeL && !singleBrakeR && vF > 4) {
+    const velH = Math.atan2(ship.velocity.dot(f.right), Math.max(0.5, ship.velocity.dot(f.tangent)));
+    const err = wrapAngle(velH - ship.heading);
+    ship.heading = wrapAngle(ship.heading + err * Math.min(1, P.groundedAlignRate * dt));
+  }
+
+  // ---- 2. Thrust & Braking Curve (spec 3 & 5) -----------------------------
+  const effFrac = Math.max(0, vF / effTop);
+  let accel = 0;
+  if (inp.throttle && effFrac < 1) {
+    const taper = effFrac <= P.thrustKnee ? 1 : Math.pow((1 - effFrac) / (1 - P.thrustKnee), H.speedCurveExponent);
+    accel = st.accel * taper * (boosting ? H.boostThrustMult : 1);
+  } else if (!inp.throttle && !inp.brakeDown && !bothBrakes) {
+    accel = -vF * P.coastDrag;
+  }
+
+  let decel = 0;
+  if (inp.brakeDown) decel = st.airbrake * ((inp.brakeL || inp.brakeR) ? P.hardBrakeFactor : P.plainBrakeFrac);
+  else if (bothBrakes) decel = st.airbrake * P.hardBrakeFactor;
+  else if (singleBrakeL || singleBrakeR) {
+    // Solo airbrake scrubs noticeable speed (pivot-brake); combining with same-side steer carves cleanly!
+    decel = st.airbrake * (comboSameSide ? P.airbrakeComboDragFrac : P.airbrakeSoloDragFrac);
+  }
+
+  vF += accel * dt;
+  if (decel > 0) vF = Math.max(0, vF - decel * dt);
+  if (vF > effTop) vF -= (vF - effTop) * Math.min(1, P.overSpeedDamp * dt);
+
+  // ---- 3. Lateral Grip, WipeOut Pivot-Drift & Double-Tap Sideshift --------
+  let grip = grounded ? st.lateralGrip : st.lateralGrip * P.gripAirMult;
+  if (singleBrakeL || singleBrakeR) {
+    // Airbrake ALONE loosens rear grip into a wide drift; Steer + Airbrake (D+E / A+Q) hooks the apex hard!
+    grip *= comboSameSide ? P.airbrakeComboGripMult : P.airbrakeSoloGripMult;
+  }
+  vSide *= Math.exp(-grip * dt);
+
+  // Instant WipeOut 2097/HD Sideshift on double-tap Q-Q / E-E (or ,-, / .-.)!
+  const nowMs = performance.now();
+  const tap = airbrakeTapState[ship.player];
+  if (tap && tap.pendingDir !== 0) {
+    const dir = tap.pendingDir;
+    tap.pendingDir = 0;
+    if (nowMs - ship.lastSideshiftAt >= P.sideshiftCooldownMs) {
+      vSide += dir * P.sideshiftImpulse;
+      ship.lastSideshiftAt = nowMs;
+      ship.sideshiftUntil = nowMs + 550;
+      ship.shakeMag = Math.max(ship.shakeMag, 0.32);
+    }
+  }
+
+  // Reconstruct 3D velocity ONCE before normal/gravity & external impulses
+  ship.velocity.copy(S2).multiplyScalar(vF).addScaledVector(S3, vSide).addScaledVector(f.up, vNorm);
+
+  // ---- 4. Boost Pads (spec 7): instant velocity kick + FOV/shake ----------
+  if (grounded && nowMs - ship.lastPadAt > H.padCooldownMs) {
+    const fracHere = ship.trackIdx / N;
+    const halfFrac = (CONFIG.track.padLenAlong * 0.55) / totalDist;
+    for (const bt of CONFIG.track.boostPadsT) {
+      const dd = Math.min(Math.abs(fracHere - bt), Math.abs(fracHere - bt + 1), Math.abs(fracHere - bt - 1));
+      if (dd <= halfFrac && Math.abs(ship.lane) <= CONFIG.track.padAcross * 0.75) {
+        const cap = st.topSpeed * H.padCapFrac;
+        const curSpd = ship.velocity.length();
+        const targetSpd = Math.min(Math.max(curSpd, cap), curSpd + H.padInstantKick);
+        const add = Math.max(0, targetSpd - curSpd);
+        ship.velocity.addScaledVector(S2, add);
+        ship.boostEnergy = Math.min(H.maxEnergy, ship.boostEnergy + 12);
+        ship.lastPadAt = nowMs;
+        ship.shakeMag = Math.max(ship.shakeMag, 0.45);
+        break;
+      }
+    }
+  }
+
+  // ---- 5. Hover Spring vs. World -Y Gravity & Landings (spec 1 & 2) -------
+  const groundBefore = ship.onGround;
+  if (grounded) {
+    const relUp = ship.velocity.dot(f.up);
+    const springAcc = st.hoverK * (H.hoverHeight - ship.height) - st.hoverDamp * relUp;
+    ship.velocity.addScaledVector(f.up, springAcc * dt);
+    // Project gravity's along-track slope effect subtly so climbs/drops feel physical
+    const slopeGravity = -H.gravity * f.tangent.y * 0.35;
+    ship.velocity.addScaledVector(f.tangent, slopeGravity * dt);
+
+    // Touchdown check!
+    const spdNow = ship.velocity.length();
+    if (!groundBefore && spdNow > H.landingMinSpeed) {
+      S4.copy(ship.velocity).normalize();
+      const alignDeg = Math.acos(Math.max(-1, Math.min(1, S2.dot(f.tangent)))) * 180 / Math.PI;
+      const pitchErrDeg = Math.abs(ship.visualPitch) * 180 / Math.PI;
+      if (alignDeg <= H.perfectLandingAngleDeg * 1.8 && pitchErrDeg <= 22) {
+        ship.boostEnergy = Math.min(H.maxEnergy, ship.boostEnergy + H.landingBoostGain);
+        ship.velocity.multiplyScalar(1 + H.landingSpeedBonusFrac);
+        ship.perfectLandingUntil = nowMs + H.landingFlashMs;
+      } else {
+        ship.velocity.multiplyScalar(1 - H.badLandingScrubFrac);
+      }
+      ship.landedFlashUntil = nowMs + H.landingFlashMs;
+      ship.shakeMag = Math.max(ship.shakeMag, 0.55);
+    }
+  } else {
+    // Airborne: pure world -Y gravity, momentum preserved!
+    ship.velocity.y -= H.gravity * dt;
+  }
+
+  // ---- 6. Integrate World Position & Resolve Track Surface / Walls --------
+  ship.pos.addScaledVector(ship.velocity, dt);
+
+  // Re-evaluate against nearest sample after integration so high speed never tunnels
+  ship.trackIdx = nearestIndex(ship, maxSearch);
+  const fAfter = trackTable[ship.trackIdx];
+  ship.distAlong = fAfter.dist;
+  S1.copy(ship.pos).sub(fAfter.pos);
+  let laneNow = S1.dot(fAfter.right);
+  let heightNow = S1.dot(fAfter.up);
+
+  // Prevent sinking through the solid road mesh on hard landings
+  const overRoadAfter = !inGap(ship.trackIdx);
+  if (overRoadAfter && grounded && heightNow < 0.35) {
+    heightNow = 0.35;
+    const vn = ship.velocity.dot(fAfter.up);
+    if (vn < 0) ship.velocity.addScaledVector(fAfter.up, -vn * 0.85);
+    ship.pos.copy(fAfter.pos).addScaledVector(fAfter.right, laneNow).addScaledVector(fAfter.up, heightNow);
+  }
+
+  // Wall collision (spec 6): glancing hits slide with small loss; steep hits lose speed and BOUNCE inward
+  const maxLane = CONFIG.track.roadHalfWidth - H.wallMargin;
+  let wallHit = false;
+  if (overRoadAfter && Math.abs(laneNow) > maxLane) {
+    const sign = laneNow > 0 ? 1 : -1; // +1 = right wall, -1 = left wall
+    laneNow = sign * maxLane;
+    const vOut = ship.velocity.dot(fAfter.right) * sign; // speed into the wall
+    const vAlong = ship.velocity.dot(fAfter.tangent);
+    if (vOut > 0) {
+      const impactAngleSin = vOut / (Math.hypot(vOut, vAlong) + 1e-5); // 0 = grazing, 1 = head-on
+      const speedLoss = H.wallGrazingLoss + (H.wallHeadOnLoss - H.wallGrazingLoss) * impactAngleSin * impactAngleSin;
+      // Bounce inward along -sign * right, and scrub forward speed proportionally to impact angle
+      const bounceIn = Math.max(H.wallMinBounceSpeed * impactAngleSin, vOut * H.wallBounceRestitution);
+      ship.velocity.addScaledVector(fAfter.right, -sign * (vOut + bounceIn));
+      ship.velocity.multiplyScalar(Math.max(0.25, 1 - speedLoss));
+      // Nudge heading slightly back toward track tangent so ship slides along the wall instead of sticking
+      ship.heading = wrapAngle(ship.heading - sign * Math.min(0.35, impactAngleSin * 0.45));
+      ship.shakeMag = Math.max(ship.shakeMag, 0.25 + 0.55 * impactAngleSin);
+    }
+    ship.pos.copy(fAfter.pos).addScaledVector(fAfter.right, laneNow).addScaledVector(fAfter.up, heightNow);
+    wallHit = true;
+    ship.wallFlashUntil = nowMs + H.wallFlashMs;
+    ship.driftStreakSec = 0; // wall contact cancels clean drift streak
+    if (typeof emitSparks === 'function') emitSparks(ship.pos, fAfter.up, sign * -1, 10);
+  } else if (overRoadAfter && grounded && Math.abs(laneNow) > maxLane - H.wallScrapeBand && ship.velocity.lengthSq() > 225) {
+    if (typeof emitSparks === 'function' && Math.random() < 0.35) emitSparks(ship.pos, fAfter.up, laneNow > 0 ? -1 : 1, 2);
+  }
+
+  ship.lane = laneNow;
+  ship.height = heightNow;
+
+  // ---- 7. Boost Energy & Clean Drift Rewards (spec 7 & 10) ----------------
+  if (boosting) {
+    ship.boostEnergy = Math.max(0, ship.boostEnergy - H.boostDrain * dt);
+  } else {
+    const onLine = grounded && Math.abs(ship.lane) <= P.racingLineAbsLane;
+    const regenMult = onLine ? P.racingLineBoostRegenGain : 1.0;
+    ship.boostEnergy = Math.min(H.maxEnergy, ship.boostEnergy + H.boostRegenIdle * regenMult * dt);
+  }
+
+  const fwdSpd = Math.max(0, ship.velocity.dot(S2));
+  const sideSpd = ship.velocity.dot(S3);
+  const slipDeg = Math.abs(Math.atan2(sideSpd, Math.max(1, fwdSpd))) * 180 / Math.PI;
+  if (grounded && !wallHit && fwdSpd > P.driftMinSpeed && slipDeg >= P.driftMinDeg) {
+    ship.drifting = true;
+    ship.driftStreakSec += dt;
+    ship.boostEnergy = Math.min(H.maxEnergy, ship.boostEnergy + P.driftAwardRate * dt);
+  } else {
+    ship.drifting = false;
+    ship.driftStreakSec = Math.max(0, ship.driftStreakSec - dt * 2);
+  }
+  if (!Number.isFinite(ship.boostEnergy)) ship.boostEnergy = 0;
+
+  // ---- 8. Visual Orientation (smooth up slerp, slide roll, air velocity pitch) -
+  const targetRoll = Math.max(-H.maxVisualRoll, Math.min(H.maxVisualRoll, -sideSpd * H.slideVisualGain - (inp.steerX || 0) * 0.16));
+  let targetPitch = 0;
+  if (!grounded && ship.velocity.lengthSq() > 4) {
+    S4.copy(ship.velocity).normalize();
+    targetPitch = Math.max(-H.maxPitchRad, Math.min(H.maxPitchRad, Math.asin(Math.max(-1, Math.min(1, S4.y))) * 0.75));
+  } else {
+    targetPitch = Math.max(-0.35, Math.min(0.35, (H.hoverHeight - ship.height) * H.pitchVisualGain));
+  }
+  ship.visualRoll += (targetRoll - ship.visualRoll) * Math.min(1, H.visualRollRate * dt);
+  ship.visualPitch += (targetPitch - ship.visualPitch) * Math.min(1, (grounded ? H.visualPitchRate : H.airPitchRate) * dt);
+
+  // Smoothly align ship up-vector toward track normal when grounded, or gently toward world-up in air (spec 1)
+  const desiredUp = grounded ? fAfter.up : WORLD_UP;
+  const upRate = grounded ? H.groundUpLerpRate : 1.8;
+  ship.up.lerp(desiredUp, Math.min(1, upRate * dt)).normalize();
+
+  // Forward nose vector orthogonalized against smoothed ship.up, with pitch applied
+  ship.forward.copy(fAfter.tangent).multiplyScalar(Math.cos(ship.heading)).addScaledVector(fAfter.right, Math.sin(ship.heading));
+  ship.forward.projectOnPlane(ship.up).normalize();
+  if (Math.abs(ship.visualPitch) > 1e-4) {
+    S5.crossVectors(ship.forward, ship.up).normalize(); // local right axis
+    ship.forward.applyAxisAngle(S5, ship.visualPitch).normalize();
+  }
+
+  ship.shakeMag = Math.max(0, ship.shakeMag - CONFIG.camera.shakeDecay * dt);
+  ship.forwardVel = fwdSpd;
+  ship.laneVel = sideSpd;
+  ship.normalVel = ship.velocity.dot(fAfter.up);
+  ship.prevOnGround = groundBefore;
+  ship.onGround = grounded;
+}
+
+/* Spec 8: ship-vs-ship sphere collision with momentum exchange + sideways shove. */
+function stepCollisions() {
+  const H = CONFIG.ships;
+  for (let i = 0; i < ships.length; i++) {
+    for (let j = i + 1; j < ships.length; j++) {
+      const a = ships[i], b = ships[j];
+      if (a.fellAt > 0 || b.fellAt > 0) continue;
+      const dx = a.pos.x - b.pos.x, dy = a.pos.y - b.pos.y, dz = a.pos.z - b.pos.z;
+      const d2 = dx * dx + dy * dy + dz * dz, r = H.shipCollisionRadius;
+      if (d2 >= r * r || d2 < 1e-9) continue;
+      const d = Math.sqrt(d2), nx = dx / d, ny = dy / d, nz = dz / d, overlap = r - d;
+      S1.set(nx, ny, nz);
+      a.pos.addScaledVector(S1, overlap * 0.52);
+      b.pos.addScaledVector(S1, -overlap * 0.52);
+      const approach = (a.velocity.x - b.velocity.x) * nx + (a.velocity.y - b.velocity.y) * ny + (a.velocity.z - b.velocity.z) * nz;
+      const jImp = approach < 0 ? -approach * H.collisionImpulse * 0.5 : 0;
+      const shove = H.collisionSideShove * 0.5;
+      a.velocity.addScaledVector(S1, jImp + shove);
+      b.velocity.addScaledVector(S1, -(jImp + shove));
+      a.shakeMag = Math.max(a.shakeMag, 0.4);
+      b.shakeMag = Math.max(b.shakeMag, 0.4);
+    }
+  }
+  stepLegoInteractions();
+}
+
+/* ---- Interactive LEGO props on the racing line (smash crates / collect studs) ---- */
+let legoPropState = [];
+let legoPropGroup = null;
+
+function legoPropMat(hex, emissiveIntensity = 0.2) {
+  return legoPlasticMat(hex, hex, emissiveIntensity);
+}
+
+function buildLegoPropMesh(kind) {
+  const g = new THREE.Group();
+  const red = legoPropMat('#c91a09', 0.22);
+  const yellow = legoPropMat('#f5cd2f', 0.28);
+  const blue = legoPropMat('#0055bf', 0.22);
+  const green = legoPropMat('#00852b', 0.22);
+  const white = legoPropMat('#f4f4f4', 0.12);
+  const U = LEGO.U, PH = LEGO.PLATE_H, BH = LEGO.BRICK_H;
+
+  if (kind === 'stud') {
+    // Floating translucent-ish gold stud pickup
+    const gem = legoPropMat('#ffd24d', 0.55);
+    placeBrick(g, makeLegoBrick(2, 1, 2, gem), 0, 0, 0);
+    placeBrick(g, makeLegoBrick(1, 1, 1, yellow, { studs: false }), 0, PH, 0);
+  } else if (kind === 'tower') {
+    placeBrick(g, makeLegoBrick(2, 1, 2, blue), 0, 0, 0);
+    placeBrick(g, makeLegoBrick(2, 3, 2, red), 0, PH, 0);
+    placeBrick(g, makeLegoBrick(2, 3, 2, yellow), 0, PH + BH, 0);
+    placeBrick(g, makeLegoBrick(2, 1, 2, white), 0, PH + BH * 2, 0);
+  } else {
+    // crate — short 2×2 stack obstacle
+    placeBrick(g, makeLegoBrick(2, 1, 2, green), 0, 0, 0);
+    placeBrick(g, makeLegoBrick(2, 3, 2, red), 0, PH, 0);
+    placeBrick(g, makeLegoBrick(2, 1, 2, yellow), 0, PH + BH, 0);
+  }
+  g.scale.setScalar(CONFIG.track.legoScale);
+  return g;
+}
+
+function disposeLegoProps() {
+  if (legoPropGroup) {
+    scene.remove(legoPropGroup);
+    legoPropGroup.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const m of mats) m.dispose();
+      }
+    });
+  }
+  legoPropGroup = null;
+  legoPropState = [];
+}
+
+function buildLegoProps() {
+  disposeLegoProps();
+  if (!trackTable.length) return;
+  legoPropGroup = new THREE.Group();
+  legoPropGroup.name = 'legoProps';
+  scene.add(legoPropGroup);
+  const N = CONFIG.track.samples;
+  const gap = CONFIG.track.jumpGap;
+  for (const def of CONFIG.track.legoProps) {
+    if (def.t >= gap[0] - 0.02 && def.t <= gap[1] + 0.02) continue; // never in the jump void
+    const idx = Math.round(def.t * N) % N;
+    const f = trackTable[idx];
+    const mesh = buildLegoPropMesh(def.kind);
+    const hover = def.kind === 'stud' ? 1.35 : 0.15;
+    mesh.position.copy(f.pos).addScaledVector(f.right, def.lane).addScaledVector(f.up, hover);
+    // Sit upright on track frame (no ship roll)
+    M4.makeBasis(f.right, f.up, f.tangent);
+    mesh.quaternion.setFromRotationMatrix(M4);
+    mesh.userData.baseQuat = mesh.quaternion.clone();
+    legoPropGroup.add(mesh);
+    legoPropState.push({
+      kind: def.kind,
+      lane: def.lane,
+      trackIdx: idx,
+      mesh,
+      active: true,
+      respawnAt: 0,
+      basePos: mesh.position.clone(),
+      up: f.up.clone(),
+      spin: Math.random() * Math.PI * 2,
+    });
+  }
+}
+
+function stepLegoInteractions() {
+  if (!legoPropState.length || state.phase === 'select') return;
+  const T = CONFIG.track;
+  const now = performance.now();
+  for (const prop of legoPropState) {
+    if (!prop.active) {
+      if (prop.respawnAt && now >= prop.respawnAt) {
+        prop.active = true;
+        prop.respawnAt = 0;
+        prop.mesh.visible = true;
+        prop.mesh.scale.setScalar(T.legoScale);
+      }
+      continue;
+    }
+    for (const ship of ships) {
+      if (!ship || ship.fellAt > 0) continue;
+      const dx = ship.pos.x - prop.basePos.x;
+      const dy = ship.pos.y - prop.basePos.y;
+      const dz = ship.pos.z - prop.basePos.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      const rad = prop.kind === 'stud' ? T.legoStudRadius : T.legoHitRadius;
+      if (d2 > rad * rad) continue;
+
+      prop.active = false;
+      prop.respawnAt = now + T.legoRespawnMs;
+      prop.mesh.visible = false;
+
+      if (prop.kind === 'stud') {
+        ship.boostEnergy = Math.min(CONFIG.ships.maxEnergy, ship.boostEnergy + T.legoStudBoost);
+        ship.legoStudUntil = now + 900;
+        ship.shakeMag = Math.max(ship.shakeMag, 0.18);
+      } else {
+        // Smash crate/tower: bounce, scrub a bit of speed, grant a little boost, sparks
+        const f = trackTable[ship.trackIdx] || trackTable[prop.trackIdx];
+        S1.copy(ship.pos).sub(prop.basePos);
+        if (S1.lengthSq() < 1e-6) S1.copy(f.tangent);
+        S1.normalize();
+        ship.velocity.addScaledVector(S1, T.legoSmashImpulse);
+        ship.velocity.multiplyScalar(prop.kind === 'tower' ? 0.88 : 0.93);
+        ship.boostEnergy = Math.min(CONFIG.ships.maxEnergy, ship.boostEnergy + T.legoCrateBoost);
+        ship.legoSmashUntil = now + 850;
+        ship.shakeMag = Math.max(ship.shakeMag, prop.kind === 'tower' ? 0.55 : 0.4);
+        emitSparks(prop.basePos, f.up, 0, prop.kind === 'tower' ? 14 : 9);
+      }
+      break;
+    }
+  }
+}
+
+function updateLegoPropsVisual(dt, nowMs) {
+  if (!legoPropState.length) return;
+  for (const prop of legoPropState) {
+    if (!prop.active) continue;
+    prop.spin += dt * (prop.kind === 'stud' ? 2.8 : 0.55);
+    if (prop.kind === 'stud') {
+      const bob = Math.sin(nowMs * 0.005 + prop.spin) * 0.22;
+      prop.mesh.position.copy(prop.basePos).addScaledVector(prop.up, bob);
+      prop.mesh.quaternion.copy(prop.mesh.userData.baseQuat);
+      prop.mesh.rotateOnAxis(prop.up, prop.spin);
+    } else {
+      // Subtle idle wobble so crates read as toys, not scenery
+      prop.mesh.position.copy(prop.basePos);
+      prop.mesh.quaternion.copy(prop.mesh.userData.baseQuat);
+      prop.mesh.rotateOnAxis(prop.up, Math.sin(prop.spin) * 0.08);
+    }
+  }
+}
+
+/* If you fell in / around the jump, snap lastValid to the landing apron (not the ramp). */
+function snapRespawnPastJump(ship) {
+  const N = CONFIG.track.samples;
+  const gap = CONFIG.track.jumpGap;
+  const tNow = ship.trackIdx / N;
+  const tValid = (ship.lastValidIdx ?? 0) / N;
+  // Launch lip, void, or short of the landing — don't put them back on the ramp
+  const missedJump =
+    (tNow >= gap[0] - 0.02 && tNow <= gap[1] + 0.08) ||
+    (tValid >= gap[0] - 0.045 && tValid <= gap[1]);
+  if (!missedJump) return;
+  const landIdx = Math.min(N - 1, Math.ceil(gap[1] * N) + 12);
+  const hw = CONFIG.track.roadHalfWidth;
+  ship.lastValidIdx = landIdx;
+  ship.lastValidLane = Math.max(-hw * 0.45, Math.min(hw * 0.45, ship.lastValidLane ?? CONFIG.track.lanes[ship.player]));
+}
+
+/* Spec 9: falling off track -> respawn after 1 s at the LAST VALID POINT with speed penalty. */
+function checkRespawn(ship) {
+  const H = CONFIG.ships;
+  const nowMs = performance.now();
+  if (ship.fellAt > 0) {
+    if (nowMs - ship.fellAt >= H.respawnDelayMs) {
+      snapRespawnPastJump(ship);
+      const idx = ship.lastValidIdx ?? Math.round(CONFIG.track.startLineT * CONFIG.track.samples);
+      const g = trackTable[idx];
+      const lane = ship.lastValidLane ?? CONFIG.track.lanes[ship.player];
+      ship.pos.copy(g.pos).addScaledVector(g.right, lane).addScaledVector(g.up, H.hoverHeight);
+      ship.prevPos.copy(ship.pos);
+      const keptSpeed = Math.min(30, ship.savedSpeed * H.respawnKeepFrac);
+      ship.velocity.copy(g.tangent).multiplyScalar(keptSpeed);
+      ship.heading = 0;
+      ship.forward.copy(g.tangent); ship.prevForward.copy(g.tangent);
+      ship.up.copy(g.up); ship.prevUp.copy(g.up);
+      if (ship.prevTangent) ship.prevTangent.copy(g.tangent);
+      ship.visualRoll = 0; ship.visualPitch = 0;
+      ship.onGround = true; ship.prevOnGround = true;
+      ship.trackIdx = idx; ship.distAlong = g.dist;
+      ship.lane = lane; ship.height = H.hoverHeight;
+      ship.fellAt = 0;
+      ship.respawnPenaltyUntil = nowMs + H.respawnPenaltyTime * 1000;
+    }
+    return;
+  }
+  // Trigger fall-off if ship drops far below the track (including missing the jump gap!)
+  if (ship.height < -H.respawnDropDepth) {
+    ship.savedSpeed = ship.velocity.length();
+    ship.fellAt = nowMs;
+    snapRespawnPastJump(ship);
+  }
+}
+
+/* ---- CAMERA: one PerspectiveCamera per viewport (spec: separate cameras) */
+function makeCamera(player) {
+  const hh = Math.max(1, Math.floor(window.innerHeight / 2));
+  const cam = new THREE.PerspectiveCamera(CONFIG.camera.fovBase, window.innerWidth / hh, 0.1, 2000);
+  scene.add(cam);
+  return {
+    player, cam,
+    pos: new THREE.Vector3(),
+    offset: new THREE.Vector3(0, CONFIG.camera.upDistance, -CONFIG.camera.backDistance),
+    vel: new THREE.Vector3(),
+    shakePhase: player * 2.1,
+  };
+}
+
+/* Chase camera: springs the RELATIVE OFFSET (so ship never outruns camera at 600+ km/h!),
+   plus small speed stretch, FOV ramp, partial track-up adoption, and impact shake. */
+function updateCamera(rc, ship, dt, renderShipPos) {
+  const C = CONFIG.camera;
+  const anchor = renderShipPos || ship.pos;
+  const f = trackTable[ship.trackIdx] || { up: WORLD_UP };
+  const clampedDt = Math.min(0.1, Math.max(0, dt));
+  const subSteps = Math.max(1, Math.ceil(clampedDt / (1 / 60)));
+  const subDt = clampedDt / subSteps;
+  const damp = 2 * Math.sqrt(C.springStiffness);
+
+  // Subtle dynamic stretch (max +0.55 m at top speed) so acceleration feels alive while keeping standard chase distance!
+  const spdFrac = Math.min(1.2, ship.velocity.length() / C.speedRefForFov);
+  const targetBack = C.backDistance + spdFrac * 0.55;
+  S1.copy(ship.forward).multiplyScalar(-targetBack).addScaledVector(f.up, C.upDistance);
+
+  for (let i = 0; i < subSteps; i++) {
+    S2.copy(S1).sub(rc.offset).multiplyScalar(C.springStiffness);
+    rc.vel.addScaledVector(S2, subDt);
+    rc.vel.multiplyScalar(Math.exp(-damp * subDt));
+    rc.offset.addScaledVector(rc.vel, subDt);
+  }
+  rc.pos.copy(anchor).add(rc.offset);
+
+  // Camera up: blend world-up with track's local up (spec: strong bank feel, never nauseating)
+  S2.copy(f.up).multiplyScalar(C.upInfluence).addScaledVector(WORLD_UP, 1 - C.upInfluence).normalize();
+  rc.cam.up.lerp(S2, Math.min(1, C.upLerpRate * clampedDt)).normalize();
+
+  // Look-ahead + subtle procedural shake on wall hits / landings / boost pads
+  rc.cam.position.copy(rc.pos);
+  if (C.shakeGain > 0 && ship.shakeMag > 0.005) {
+    rc.shakePhase += clampedDt * 47;
+    const amp = ship.shakeMag * C.shakeGain;
+    rc.cam.position.x += Math.sin(rc.shakePhase * 1.7) * amp;
+    rc.cam.position.y += Math.cos(rc.shakePhase * 2.3) * amp * 0.8;
+    rc.cam.position.z += Math.sin(rc.shakePhase * 1.3) * amp;
+  }
+  S1.copy(anchor).addScaledVector(ship.forward, C.lookAhead);
+  rc.cam.lookAt(S1);
+
+  const targetFov = THREE.MathUtils.lerp(C.fovBase, C.fovMax, Math.min(1, spdFrac));
+  rc.cam.fov += (targetFov - rc.cam.fov) * Math.min(1, C.fovLerp * clampedDt);
+  rc.cam.updateProjectionMatrix();
+}
+
+/* ---- RENDER & PHASE 6 FX ("AAA Neon": PMREM envmap, Bloom, Chroma, Trails, Sparks, Speed Lines) */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: CONFIG.render.preserveDrawingBuffer });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.render.maxPixelRatio));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMappingExposure = CONFIG.render.toneMappingExposure;
+renderer.autoClear = false;
+document.body.appendChild(renderer.domElement);
+
+// Soft pre-filtered environment map (sigma=0.14 blurs out the intense white studio softboxes in RoomEnvironment so the track has smooth dark sci-fi reflections without harsh white glare!)
+const pmremGen = new THREE.PMREMGenerator(renderer);
+const envRT = pmremGen.fromScene(new RoomEnvironment(), 0.14);
+scene.environment = envRT.texture;
+pmremGen.dispose();
+
+// Radial high-speed chromatic aberration shader pass
+const ChromaShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    amount: { value: 0.0 },
+  },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float amount;
+    varying vec2 vUv;
+    void main() {
+      vec2 off = (vUv - 0.5) * amount * length(vUv - 0.5) * 2.2;
+      float r = texture2D(tDiffuse, vUv + off).r;
+      float g = texture2D(tDiffuse, vUv).g;
+      float b = texture2D(tDiffuse, vUv - off).b;
+      gl_FragColor = vec4(r, g, b, 1.0);
+    }`,
+};
+
+// ONE single EffectComposer over the full split-screen render target (cuts post-FX GPU cost in HALF -> locked 144 FPS!)
+let mainComposer = null, mainBloom = null, mainFxaaChroma = null;
+
+function buildComposers() {
+  if (mainComposer) mainComposer.dispose();
+  const pr = renderer.getPixelRatio();
+  const w = Math.max(2, window.innerWidth), h = Math.max(4, window.innerHeight);
+  const effW = Math.floor(w * pr), effH = Math.floor(h * pr);
+
+  // Pass a non-MSAA HalfFloat render target into EffectComposer so swapBuffers() never triggers a double 16-bit MSAA resolve stall!
+  // Our 9-tap directional FXAA pass smooths all edges at locked 144 FPS!
+  const rt = new THREE.WebGLRenderTarget(effW, effH, {
+    type: THREE.HalfFloatType,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    samples: 0,
+  });
+
+  mainComposer = new EffectComposer(renderer, rt);
+  mainComposer.renderToScreen = true;
+  mainComposer.setPixelRatio(pr);
+  mainComposer.setSize(w, h);
+
+  // Pass 1: quarter-res Bloom (only ONCE per frame for the whole split-screen!)
+  mainBloom = new UnrealBloomPass(
+    new THREE.Vector2(Math.max(2, Math.floor(w * 0.35)), Math.max(2, Math.floor(h * 0.35))),
+    CONFIG.render.bloomStrength,
+    CONFIG.render.bloomRadius,
+    CONFIG.render.bloomThreshold
+  );
+
+  // Pass 2: ACESFilmic + sRGB OutputPass
+  const outPass = new OutputPass();
+
+  // Pass 3: Combined FXAA + per-half speed chromatic aberration (top half uses P1 speed, bottom half uses P2 speed!)
+  mainFxaaChroma = new ShaderPass({
+    uniforms: {
+      tDiffuse: { value: null },
+      resolution: { value: new THREE.Vector2(1 / effW, 1 / effH) },
+      chromaTop: { value: 0.0 },
+      chromaBot: { value: 0.0 },
+    },
+    vertexShader: FXAAShader.vertexShader,
+    fragmentShader: `
+      uniform sampler2D tDiffuse;
+      uniform vec2 resolution;
+      uniform float chromaTop;
+      uniform float chromaBot;
+      varying vec2 vUv;
+      void main() {
+        vec3 rgbNW = texture2D(tDiffuse, vUv + vec2(-1.0, -1.0) * resolution).rgb;
+        vec3 rgbNE = texture2D(tDiffuse, vUv + vec2( 1.0, -1.0) * resolution).rgb;
+        vec3 rgbSW = texture2D(tDiffuse, vUv + vec2(-1.0,  1.0) * resolution).rgb;
+        vec3 rgbSE = texture2D(tDiffuse, vUv + vec2( 1.0,  1.0) * resolution).rgb;
+        vec3 rgbM  = texture2D(tDiffuse, vUv).rgb;
+        vec3 luma = vec3(0.299, 0.587, 0.114);
+        float lNW = dot(rgbNW, luma), lNE = dot(rgbNE, luma), lSW = dot(rgbSW, luma), lSE = dot(rgbSE, luma), lM = dot(rgbM, luma);
+        float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+        float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+        vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), ((lNW + lSW) - (lNE + lSE)));
+        float dirReduce = max((lNW + lNE + lSW + lSE) * (0.25 * 0.125), 1.0 / 128.0);
+        float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+        dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * resolution;
+        vec3 rgbA = 0.5 * (texture2D(tDiffuse, vUv + dir * (1.0/3.0 - 0.5)).rgb + texture2D(tDiffuse, vUv + dir * (2.0/3.0 - 0.5)).rgb);
+        vec3 rgbB = rgbA * 0.5 + 0.25 * (texture2D(tDiffuse, vUv + dir * -0.5).rgb + texture2D(tDiffuse, vUv + dir * 0.5).rgb);
+        float lB = dot(rgbB, luma);
+        vec3 aaCol = (lB < lMin || lB > lMax) ? rgbA : rgbB;
+        float cAmt = vUv.y >= 0.5 ? chromaTop : chromaBot;
+        if (cAmt > 0.0001) {
+          vec2 localCenter = vec2(0.5, vUv.y >= 0.5 ? 0.75 : 0.25);
+          vec2 off = (vUv - localCenter) * cAmt * length(vUv - localCenter) * 2.4;
+          aaCol.r = texture2D(tDiffuse, vUv + off).r;
+          aaCol.b = texture2D(tDiffuse, vUv - off).b;
+        }
+        gl_FragColor = vec4(aaCol, 1.0);
+      }`,
+  });
+
+  mainComposer.addPass(mainBloom);
+  mainComposer.addPass(outPass);
+  mainComposer.addPass(mainFxaaChroma);
+}
+
+/* ---- LEGO brick kit (classic 8 mm stud pitch → world units) ------------ */
+const LEGO = {
+  U: 0.32,
+  get BRICK_H() { return this.U * 1.2; },
+  get PLATE_H() { return this.U * 0.4; },
+  get STUD_R() { return this.U * 0.30; },
+  get STUD_H() { return this.U * 0.22; },
+  _studGeo: null,
+  _cylCache: new Map(),
+  studGeo() {
+    if (!this._studGeo) this._studGeo = new THREE.CylinderGeometry(this.STUD_R, this.STUD_R, this.STUD_H, 8);
+    return this._studGeo;
+  },
+  cylGeo(r0, r1, h, seg = 8) {
+    const key = `${r0.toFixed(3)}_${r1.toFixed(3)}_${h.toFixed(3)}_${seg}`;
+    if (!this._cylCache.has(key)) this._cylCache.set(key, new THREE.CylinderGeometry(r0, r1, h, seg));
+    return this._cylCache.get(key);
+  },
+};
+
+function legoPlasticMat(hex, emissiveHex, emissiveIntensity = 0.28) {
+  return new THREE.MeshStandardMaterial({
+    color: hex,
+    emissive: emissiveHex || hex,
+    emissiveIntensity,
+    roughness: 0.42,
+    metalness: 0.08,
+    envMapIntensity: 0.85,
+  });
+}
+
+function legoTransMat(hex, emissiveHex) {
+  // Cheap translucent ABS — NO MeshPhysical transmission (keeps 144 FPS)
+  return new THREE.MeshStandardMaterial({
+    color: hex,
+    emissive: emissiveHex || hex,
+    emissiveIntensity: 0.28,
+    roughness: 0.22,
+    metalness: 0.15,
+    transparent: true,
+    opacity: 0.72,
+    envMapIntensity: 1.05,
+  });
+}
+
+/** Single-mesh brick/plate with baked studs (1 draw call). Origin = geometric centre. */
+function makeLegoBrick(sx, syModules, sz, mat, { studs = true } = {}) {
+  const U = LEGO.U;
+  const h = syModules * LEGO.PLATE_H;
+  const body = new THREE.BoxGeometry(sx * U, h, sz * U);
+  if (!studs) {
+    const mesh = new THREE.Mesh(body, mat);
+    mesh.userData.halfH = h * 0.5;
+    return mesh;
+  }
+  const geos = [body];
+  const yTop = h * 0.5 + LEGO.STUD_H * 0.5;
+  for (let ix = 0; ix < sx; ix++) {
+    for (let iz = 0; iz < sz; iz++) {
+      const stud = LEGO.studGeo().clone();
+      stud.translate((ix - (sx - 1) * 0.5) * U, yTop, (iz - (sz - 1) * 0.5) * U);
+      geos.push(stud);
+    }
+  }
+  const merged = mergeLegoGeos(geos);
+  for (const geo of geos) geo.dispose();
+  const mesh = new THREE.Mesh(merged, mat);
+  mesh.userData.halfH = h * 0.5;
+  return mesh;
+}
+
+function mergeLegoGeos(geos) {
+  // Manual merge (no BufferGeometryUtils import) — positions + normals only
+  let vCount = 0;
+  for (const g of geos) vCount += g.attributes.position.count;
+  const pos = new Float32Array(vCount * 3);
+  const nrm = new Float32Array(vCount * 3);
+  const idx = [];
+  let vo = 0;
+  for (const g of geos) {
+    const p = g.attributes.position;
+    const n = g.attributes.normal;
+    const base = vo;
+    for (let i = 0; i < p.count; i++, vo++) {
+      pos[vo * 3] = p.getX(i); pos[vo * 3 + 1] = p.getY(i); pos[vo * 3 + 2] = p.getZ(i);
+      if (n) { nrm[vo * 3] = n.getX(i); nrm[vo * 3 + 1] = n.getY(i); nrm[vo * 3 + 2] = n.getZ(i); }
+    }
+    if (g.index) {
+      const a = g.index.array;
+      for (let i = 0; i < a.length; i++) idx.push(a[i] + base);
+    } else {
+      for (let i = 0; i < p.count; i++) idx.push(base + i);
+    }
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  out.setIndex(idx);
+  return out;
+}
+
+/** 45° slope brick: tall at -Z, tip at +Z. Height in plate modules. */
+function makeLegoSlope(sx, syModules, sz, mat) {
+  const U = LEGO.U;
+  const h = syModules * LEGO.PLATE_H;
+  const hw = sx * U * 0.5, hh = h * 0.5, hd = sz * U * 0.5;
+  const yTip = -hh + LEGO.PLATE_H * 0.12;
+  const v = [
+    [-hw, -hh, -hd], [hw, -hh, -hd], [hw, hh, -hd], [-hw, hh, -hd],
+    [-hw, -hh,  hd], [hw, -hh,  hd], [hw, yTip, hd], [-hw, yTip, hd],
+  ];
+  const faces = [[0,1,2],[0,2,3],[4,6,5],[4,7,6],[0,4,5],[0,5,1],[3,2,6],[3,6,7],[0,3,7],[0,7,4],[1,5,6],[1,6,2]];
+  const pos = [], nrm = [];
+  for (const f of faces) {
+    const a = v[f[0]], b = v[f[1]], c = v[f[2]];
+    pos.push(...a, ...b, ...c);
+    const ax = b[0]-a[0], ay = b[1]-a[1], az = b[2]-a[2];
+    const bx = c[0]-a[0], by = c[1]-a[1], bz = c[2]-a[2];
+    let nx = ay*bz - az*by, ny = az*bx - ax*bz, nz = ax*by - ay*bx;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+    nrm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.userData.halfH = hh;
+  return mesh;
+}
+
+function placeBrick(parent, brick, xStuds, yBottom, zStuds) {
+  brick.position.set(xStuds * LEGO.U, yBottom + (brick.userData.halfH || 0), zStuds * LEGO.U);
+  parent.add(brick);
+  return brick;
+}
+
+/* Ship mesh: low piece-count LEGO AG racers (team colours, classic ABS look, few draw calls). */
+function buildShipMesh(player, shipType) {
+  const g = new THREE.Group();
+  const type = shipType || (ships && ships[player] ? ships[player].type : CONFIG.ships.shipPickDefault);
+  const colHex = CONFIG.ships.colors[player];
+  const isVolt = type === 'volt';
+  const isP1 = player === 0;
+
+  // Keep ABS plastic mostly lit by scene lights — high emissive floods UnrealBloomPass across the split midline!
+  const teamMat = legoPlasticMat(colHex, colHex, 0.18);
+  const whiteMat = legoPlasticMat('#f4f7fb', '#a8c4ef', 0.10);
+  const greyMat = legoPlasticMat('#6b727a', '#3a4048', 0.06);
+  const blackMat = legoPlasticMat('#1a1d22', '#0a0c10', 0.04);
+  const neonMat = new THREE.MeshStandardMaterial({
+    color: colHex,
+    emissive: colHex,
+    emissiveIntensity: 0.55,
+    roughness: 0.35,
+    metalness: 0.1,
+  });
+  const canopyMat = legoTransMat(isP1 ? '#3ad4ff' : '#ff5ad8', colHex);
+  const thrusterGlow = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(isP1 ? '#6bf6ff' : '#ff7af0').multiplyScalar(1.55),
+  });
+
+  const U = LEGO.U;
+  const BH = LEGO.BRICK_H;
+  const PH = LEGO.PLATE_H;
+
+  if (isVolt) {
+    // VOLT — long dart (~14 pieces): 2× spine, nose slope, thin swept wings, twin round jets
+    placeBrick(g, makeLegoBrick(2, 1, 8, teamMat), 0, 0, -0.5);
+    placeBrick(g, makeLegoBrick(2, 1, 6, greyMat, { studs: false }), 0, PH, -1.0);
+    placeBrick(g, makeLegoSlope(2, 3, 3, teamMat), 0, PH, 2.6);
+    placeBrick(g, makeLegoBrick(2, 1, 2, whiteMat), 0, PH, 0.8);
+    placeBrick(g, makeLegoBrick(2, 2, 2, canopyMat, { studs: false }), 0, PH + PH, 0.8);
+    placeBrick(g, makeLegoBrick(1, 1, 4, neonMat, { studs: false }), 0, PH + PH * 3, -0.5);
+    for (const side of [-1, 1]) {
+      placeBrick(g, makeLegoBrick(3, 1, 2, teamMat), side * 2.0, PH * 0.5, -1.2);
+      placeBrick(g, makeLegoBrick(1, 1, 2, neonMat, { studs: false }), side * 3.2, PH * 1.5, -1.2);
+      placeBrick(g, makeLegoBrick(1, 3, 2, whiteMat, { studs: false }), side * 0.85, PH, -3.0);
+      const jet = new THREE.Mesh(LEGO.cylGeo(U * 0.72, U * 0.78, U * 1.1), greyMat);
+      jet.rotation.x = Math.PI / 2;
+      jet.position.set(side * U * 0.85, PH + BH * 0.35, -U * 4.15);
+      g.add(jet);
+    }
+  } else {
+    // ARC — wide delta (~16 pieces): 4× chassis, stepped wings, angled airbrake fins, fat jets
+    placeBrick(g, makeLegoBrick(4, 1, 6, teamMat), 0, 0, -0.5);
+    placeBrick(g, makeLegoBrick(4, 1, 4, greyMat, { studs: false }), 0, PH, -1.2);
+    placeBrick(g, makeLegoSlope(2, 2, 2, teamMat), 0, PH, 2.2);
+    placeBrick(g, makeLegoBrick(2, 1, 2, whiteMat), 0, PH, 0.5);
+    placeBrick(g, makeLegoBrick(2, 2, 2, canopyMat, { studs: false }), 0, PH + PH, 0.5);
+    placeBrick(g, makeLegoBrick(2, 1, 2, blackMat, { studs: false }), 0, PH + PH * 3, -0.8);
+    for (const side of [-1, 1]) {
+      placeBrick(g, makeLegoBrick(3, 1, 3, teamMat), side * 2.5, 0, -0.8);
+      placeBrick(g, makeLegoBrick(2, 1, 2, teamMat), side * 3.5, PH, -1.6);
+      placeBrick(g, makeLegoBrick(1, 1, 2, neonMat, { studs: false }), side * 4.4, PH * 2, -1.6);
+      const fin = makeLegoBrick(1, 4, 2, whiteMat, { studs: false });
+      fin.position.set(side * U * 1.35, PH + BH * 0.85, -U * 2.4);
+      fin.rotation.z = -side * 0.38;
+      fin.rotation.x = 0.12;
+      g.add(fin);
+      const jet = new THREE.Mesh(LEGO.cylGeo(U * 0.88, U * 0.95, U * 1.25), greyMat);
+      jet.rotation.x = Math.PI / 2;
+      jet.position.set(side * U * 1.15, PH + BH * 0.4, -U * 3.55);
+      g.add(jet);
+    }
+  }
+
+  const eng = new THREE.Mesh(
+    new THREE.BoxGeometry(isVolt ? U * 2.4 : U * 3.2, U * 0.7, U * 0.55),
+    thrusterGlow
+  );
+  eng.position.set(0, PH + BH * 0.35, isVolt ? -U * 4.55 : -U * 3.95);
+  g.add(eng);
+
+  const underLight = new THREE.PointLight(colHex, 1.8, 7.5, 2.0);
+  underLight.position.set(0, -0.35, -0.6);
+  g.add(underLight);
+
+  g.position.y = -PH * 0.5;
+  g.userData = { player, type, engine: eng };
+  return g;
+}
+
+function makeSoftGlowTexture(hexCol) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const ctx = c.getContext('2d');
+  const col = new THREE.Color(hexCol);
+  const r = Math.round(col.r * 255), g = Math.round(col.g * 255), b = Math.round(col.b * 255);
+  ctx.clearRect(0, 0, 256, 256);
+
+  // Soft glossy wet-asphalt reflection: realistic blurred reflection on dark wet road (anisotropic sheen + wingtips + thruster!)
+  ctx.save();
+  ctx.filter = 'blur(12px)';
+  const grad = ctx.createRadialGradient(128, 138, 4, 128, 138, 96);
+  grad.addColorStop(0.0, `rgba(${r},${g},${b},0.48)`);
+  grad.addColorStop(0.5, `rgba(${r},${g},${b},0.18)`);
+  grad.addColorStop(1.0, `rgba(${r},${g},${b},0.0)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 256, 256);
+
+  // Blurred hull & wing reflection (blur 7px so it reads as a glossy surface reflection, NEVER a second solid ship!)
+  ctx.filter = 'blur(7px)';
+  ctx.fillStyle = `rgba(${r},${g},${b},0.58)`;
+  ctx.beginPath();
+  ctx.moveTo(128, 42);
+  ctx.lineTo(208, 162);
+  ctx.lineTo(196, 188);
+  ctx.lineTo(60, 188);
+  ctx.lineTo(48, 162);
+  ctx.closePath();
+  ctx.fill();
+
+  // Reflected neon wingtips & twin thruster streak
+  ctx.filter = 'blur(5px)';
+  ctx.fillStyle = `rgba(${Math.min(255, r + 85)},${Math.min(255, g + 85)},${Math.min(255, b + 85)},0.82)`;
+  ctx.fillRect(42, 148, 14, 42);
+  ctx.fillRect(200, 148, 14, 42);
+  ctx.fillRect(104, 178, 48, 22);
+  ctx.restore();
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/* Glossy wet-asphalt ship reflection: depth-tested glossy silhouette decal strictly ON the road surface! */
+function buildShipReflectionMesh(player) {
+  const colHex = CONFIG.ships.colors[player];
+  const puddle = new THREE.Mesh(
+    new THREE.PlaneGeometry(3.9, 4.4),
+    new THREE.MeshBasicMaterial({
+      map: makeSoftGlowTexture(colHex),
+      transparent: true,
+      opacity: CONFIG.render.shipReflectionOpacity,
+      blending: THREE.NormalBlending,
+      depthTest: true,   // 100% Z-buffer tested: NEVER draws over closer ships, walls, or track!
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -2,
+      side: THREE.DoubleSide,
+    })
+  );
+  puddle.renderOrder = 1;
+  return puddle;
+}
+
+/* ---- Engine Ribbon Trails, Wall Sparks & High-Speed Lines --------------- */
+let trailMeshes = [];
+/** Neon engine ribbons removed — only dispose leftovers on rematch. */
+function buildTrails() {
+  for (const t of trailMeshes) {
+    if (!t) continue;
+    if (t.mesh) {
+      scene.remove(t.mesh);
+      t.mesh.geometry.dispose();
+      t.mesh.material.dispose();
+    }
+    if (t.reflMesh) {
+      scene.remove(t.reflMesh);
+      t.reflMesh.geometry.dispose();
+      t.reflMesh.material.dispose();
+    }
+  }
+  trailMeshes = [];
+}
+
+// Spark particle pool on wall contact
+const sparkPool = [];
+let sparkMesh = null, sparkCursor = 0;
+{
+  const M = CONFIG.render.maxSparks;
+  const sPos = new Float32Array(M * 2 * 3); // line segments for streaky sparks!
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(sPos, 3));
+  const mat = new THREE.LineBasicMaterial({ color: new THREE.Color('#ffd166').multiplyScalar(2.4), blending: THREE.AdditiveBlending, transparent: true });
+  sparkMesh = new THREE.LineSegments(geo, mat);
+  sparkMesh.frustumCulled = false;
+  scene.add(sparkMesh);
+  for (let i = 0; i < M; i++) sparkPool.push({ life: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 });
+}
+
+function emitSparks(origin, upVec, inwardSign, count) {
+  const M = sparkPool.length;
+  for (let k = 0; k < count; k++) {
+    const sp = sparkPool[sparkCursor];
+    sparkCursor = (sparkCursor + 1) % M;
+    sp.life = 0.22 + Math.random() * 0.22;
+    sp.x = origin.x + (Math.random() - 0.5) * 0.8;
+    sp.y = origin.y + 0.2 + Math.random() * 0.5;
+    sp.z = origin.z + (Math.random() - 0.5) * 0.8;
+    sp.vx = (Math.random() - 0.5 + inwardSign * 0.6) * 18;
+    sp.vy = upVec.y * (5 + Math.random() * 14);
+    sp.vz = (Math.random() - 0.5) * 18;
+  }
+}
+
+function updateSparks(dt) {
+  const arr = sparkMesh.geometry.attributes.position.array;
+  for (let i = 0; i < sparkPool.length; i++) {
+    const sp = sparkPool[i];
+    const b = i * 6;
+    if (sp.life > 0) {
+      sp.life -= dt;
+      sp.vy -= 24 * dt;
+      sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.z += sp.vz * dt;
+      arr[b] = sp.x; arr[b + 1] = sp.y; arr[b + 2] = sp.z;
+      arr[b + 3] = sp.x - sp.vx * 0.035; arr[b + 4] = sp.y - sp.vy * 0.035; arr[b + 5] = sp.z - sp.vz * 0.035;
+    } else {
+      arr[b] = arr[b + 1] = arr[b + 2] = arr[b + 3] = arr[b + 4] = arr[b + 5] = -9999;
+    }
+  }
+  sparkMesh.geometry.attributes.position.needsUpdate = true;
+}
+
+/* Soft path-fog / wind gallery: golden dust washing over the ship at speed (replaces cheap speed-lines). */
+let softParticleTex = null;
+function getSoftParticleTexture() {
+  if (softParticleTex) return softParticleTex;
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32, 32, 1, 32, 32, 30);
+  g.addColorStop(0.0, 'rgba(255,248,230,0.95)');
+  g.addColorStop(0.25, 'rgba(255,210,160,0.45)');
+  g.addColorStop(0.65, 'rgba(220,160,110,0.12)');
+  g.addColorStop(1.0, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 64, 64);
+  softParticleTex = new THREE.CanvasTexture(c);
+  softParticleTex.colorSpace = THREE.SRGBColorSpace;
+  return softParticleTex;
+}
+
+function makeWindCloudTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 64;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, 256, 64);
+  for (let i = 0; i < 18; i++) {
+    const x = Math.random() * 256;
+    const y = 16 + Math.random() * 32;
+    const rx = 28 + Math.random() * 50;
+    const ry = 8 + Math.random() * 14;
+    const grd = ctx.createRadialGradient(x, y, 2, x, y, rx);
+    grd.addColorStop(0, `rgba(255,230,190,${0.22 + Math.random() * 0.2})`);
+    grd.addColorStop(1, 'rgba(255,200,140,0)');
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Local-space wing tip anchors (match neon tip bricks on VOLT / ARC). */
+function getWingTipAnchors(shipType) {
+  const U = LEGO.U, PH = LEGO.PLATE_H;
+  if (shipType === 'volt') {
+    return [
+      { x: -3.2 * U, y: PH * 1.55, z: -1.2 * U },
+      { x:  3.2 * U, y: PH * 1.55, z: -1.2 * U },
+    ];
+  }
+  return [
+    { x: -4.4 * U, y: PH * 2.05, z: -1.6 * U },
+    { x:  4.4 * U, y: PH * 2.05, z: -1.6 * U },
+  ];
+}
+
+/** World-space mist points: spawn on emitters, then STAY on the path (no ship-roll). */
+function makeMistPoints(count, size, color) {
+  const pos = new Float32Array(count * 3);
+  const life = new Float32Array(count);
+  // Park dead particles far away until first spawn
+  for (let i = 0; i < count; i++) {
+    pos[i * 3] = pos[i * 3 + 1] = pos[i * 3 + 2] = -9999;
+    life[i] = 0;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    map: getSoftParticleTexture(),
+    color,
+    size,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+    sizeAttenuation: true,
+    fog: true,
+  });
+  const points = new THREE.Points(geo, mat);
+  points.frustumCulled = false;
+  points.renderOrder = 2;
+  return { points, pos, life, cursor: 0 };
+}
+
+function buildWindGallery(player, shipType) {
+  const g = new THREE.Group(); // lives in SCENE (world space) — never parented to ship roll!
+  const tips = getWingTipAnchors(shipType || 'volt');
+  const team = new THREE.Color(CONFIG.ships.colors[player]);
+  const mist = new THREE.Color('#f0d2a8').lerp(team, 0.18);
+
+  const wake = makeMistPoints(CONFIG.render.windCount, CONFIG.render.windSize, mist);
+  const tipMist = makeMistPoints(
+    CONFIG.render.windTipCount,
+    CONFIG.render.windTipSize,
+    mist.clone().lerp(new THREE.Color('#ffffff'), 0.25)
+  );
+  g.add(wake.points);
+  g.add(tipMist.points);
+
+  g.userData = {
+    wake,
+    tipMist,
+    tips,
+    spawnAcc: 0,
+    // scratch emitters filled each frame in world space
+    emitWake: new THREE.Vector3(),
+    emitTips: [new THREE.Vector3(), new THREE.Vector3()],
+  };
+  g.visible = false;
+  return g;
+}
+
+function spawnMistAt(bucket, x, y, z, jitter, lifeMin, lifeSpan) {
+  const i = bucket.cursor % bucket.life.length;
+  bucket.cursor++;
+  bucket.pos[i * 3] = x + (Math.random() - 0.5) * jitter;
+  bucket.pos[i * 3 + 1] = y + (Math.random() - 0.5) * jitter * 0.6;
+  bucket.pos[i * 3 + 2] = z + (Math.random() - 0.5) * jitter;
+  bucket.life[i] = lifeMin + Math.random() * lifeSpan;
+}
+
+function updateWindGallery(ship, dt) {
+  const wg = ship.windGallery;
+  if (!wg || !ship.mesh) return;
+  const spd = ship.velocity.length();
+  const frac = state.phase === 'racing' ? Math.max(0, Math.min(1.15, (spd - 18) / CONFIG.render.windSpeedRef)) : 0;
+  wg.visible = frac > 0.04 && ship.fellAt === 0 && ship.mesh.visible;
+  if (!wg.visible) {
+    // Hide parked particles while idle
+    const { wake, tipMist } = wg.userData;
+    wake.points.material.opacity = 0;
+    tipMist.points.material.opacity = 0;
+    return;
+  }
+
+  const { wake, tipMist, tips, emitWake, emitTips } = wg.userData;
+  // Emitters follow the VISUAL hull (incl. roll), but each particle freezes in WORLD after spawn
+  // so the trail curves with the path instead of tumbling with the ship.
+  const origin = ship.mesh.position;
+  const q = ship.mesh.quaternion;
+  S3.set(1, 0, 0).applyQuaternion(q); // right
+  S2.set(0, 1, 0).applyQuaternion(q); // up
+  S1.set(0, 0, 1).applyQuaternion(q); // forward
+
+  // Thruster emitter just aft of the hull
+  emitWake.copy(origin).addScaledVector(S1, -1.85).addScaledVector(S2, 0.12);
+  // Wing-tip emitters in world space
+  for (let t = 0; t < 2; t++) {
+    const loc = tips[t];
+    emitTips[t]
+      .copy(origin)
+      .addScaledVector(S3, loc.x)
+      .addScaledVector(S2, loc.y)
+      .addScaledVector(S1, loc.z);
+  }
+
+  // Spawn rate scales with speed — leaves a curved path as the ship turns
+  wg.userData.spawnAcc += dt * (8 + frac * 28);
+  while (wg.userData.spawnAcc >= 1) {
+    wg.userData.spawnAcc -= 1;
+    spawnMistAt(wake, emitWake.x, emitWake.y, emitWake.z, 0.35, 0.45, 0.55);
+    spawnMistAt(tipMist, emitTips[0].x, emitTips[0].y, emitTips[0].z, 0.12, 0.35, 0.5);
+    spawnMistAt(tipMist, emitTips[1].x, emitTips[1].y, emitTips[1].z, 0.12, 0.35, 0.5);
+  }
+
+  // Age in place (tiny path-aligned drift only — NO orbit/roll with the hull)
+  const drift = dt * Math.min(2.5, spd * 0.04);
+  const fx = -S1.x * drift, fy = -S1.y * drift, fz = -S1.z * drift;
+  for (const bucket of [wake, tipMist]) {
+    const attr = bucket.points.geometry.attributes.position;
+    for (let i = 0; i < bucket.life.length; i++) {
+      if (bucket.life[i] <= 0) continue;
+      bucket.life[i] -= dt;
+      if (bucket.life[i] <= 0) {
+        bucket.pos[i * 3] = bucket.pos[i * 3 + 1] = bucket.pos[i * 3 + 2] = -9999;
+        continue;
+      }
+      // Soft hang in the air along the travelled path
+      bucket.pos[i * 3] += fx * 0.15;
+      bucket.pos[i * 3 + 1] += fy * 0.15 + dt * 0.08;
+      bucket.pos[i * 3 + 2] += fz * 0.15;
+    }
+    attr.needsUpdate = true;
+  }
+
+  wake.points.material.opacity = Math.min(0.42, frac * 0.38);
+  wake.points.material.size = CONFIG.render.windSize * (0.9 + frac * 0.25);
+  tipMist.points.material.opacity = Math.min(0.5, frac * 0.46);
+  tipMist.points.material.size = CONFIG.render.windTipSize * (0.95 + frac * 0.3);
+}
+
+/* Single viewport render pass for one camera/ship pair via EffectComposer! */
+function renderViewport(player, alpha) {
+  if (!cameras[player] || !ships[player]) return;
+  const w = window.innerWidth, h = window.innerHeight;
+  const solo = isGhostMode();
+  const hh = solo ? h : Math.max(2, Math.floor(h / 2));
+  const rc = cameras[player], s = ships[player];
+  // Interpolate both ships (+ their mirror reflections on the glossy track!) before the first viewport pass
+  if (player === 0) {
+    for (const sh of ships) {
+      if (!sh || !sh.mesh) continue;
+      sh.mesh.visible = state.phase !== 'select' && sh.fellAt === 0;
+      sh.mesh.position.lerpVectors(sh.prevPos, sh.pos, alpha);
+      S1.copy(sh.prevForward).lerp(sh.forward, alpha).normalize();
+      S2.copy(sh.prevUp).lerp(sh.up, alpha).normalize();
+      S3.crossVectors(S2, S1).normalize();
+      S2.crossVectors(S1, S3).normalize();
+      M4.makeBasis(S3, S2, S1);
+      Q1.setFromRotationMatrix(M4);
+      const roll = sh.prevVisualRoll + (sh.visualRoll - sh.prevVisualRoll) * alpha;
+      Q2.setFromAxisAngle(S1, roll);
+      sh.mesh.quaternion.multiplyQuaternions(Q2, Q1);
+
+      // Update glossy wet-asphalt reflection decal strictly ON the road surface (100% Z-buffer occluded by ships & walls!)
+      if (sh.reflMesh) {
+        const f = trackTable[sh.trackIdx];
+        const overRoad = !inGap(sh.trackIdx) && Math.abs(sh.lane) <= CONFIG.track.roadHalfWidth - 0.5;
+        const hAbove = S4.copy(sh.mesh.position).sub(f.pos).dot(f.up);
+        const fade = overRoad && sh.mesh.visible && hAbove > 0.05 && hAbove < 5.0
+          ? Math.max(0, Math.min(1, 1.15 - hAbove / 4.4))
+          : 0;
+        sh.reflMesh.visible = fade > 0.02;
+        if (sh.reflMesh.visible) {
+          // Place flat on the local road frame directly under the ship (+0.03m above road mesh), rotated to match ship heading!
+          sh.reflMesh.position.copy(sh.mesh.position).addScaledVector(f.up, -hAbove + 0.03);
+          S5.copy(S1).projectOnPlane(f.up).normalize(); // Y = ship forward projected onto road plane
+          S4.crossVectors(S5, f.up).normalize();        // X = Y × Z -> right-handed det = +1! (Wait: (Y × Z) × Y = Z! Wait: X × Y = (Y × Z) × Y = +Z! YES!)
+          M4.makeBasis(S4, S5, f.up);
+          sh.reflMesh.quaternion.setFromRotationMatrix(M4);
+          sh.reflMesh.material.opacity = CONFIG.render.shipReflectionOpacity * fade;
+        }
+      }
+    }
+    // Advect path-fog wind gallery once per frame (both ships)
+    const dtSec = Math.min(0.05, (performance.now() - (state._windLastMs || performance.now())) / 1000);
+    state._windLastMs = performance.now();
+    for (const sh of ships) updateWindGallery(sh, dtSec > 0 ? dtSec : 1 / 60);
+  }
+
+  // Chroma still scales with speed (no more low-quality camera speed-lines)
+  const spdFrac = state.phase === 'racing' ? Math.max(0, (s.velocity.length() - 36) / 36) : 0;
+
+  const expectedAspect = w / hh;
+  if (Math.abs(rc.cam.aspect - expectedAspect) > 1e-4) {
+    rc.cam.aspect = expectedAspect;
+    rc.cam.updateProjectionMatrix();
+  }
+
+  const baseY = solo ? 0 : (player === 0 ? hh : 0);
+  const targetRT = mainComposer ? mainComposer.writeBuffer : null;
+  renderer.setRenderTarget(targetRT);
+  renderer.setScissorTest(true);
+  renderer.setViewport(0, baseY, w, hh);
+  renderer.setScissor(0, baseY, w, hh);
+  const prevTM = renderer.toneMapping;
+  const prevCS = renderer.outputColorSpace;
+  if (targetRT) {
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  }
+  // Lock sky dome to this camera so the golden-hour sun never parallax-clips at track edges
+  skyDome.position.copy(rc.cam.position);
+  renderer.render(scene, rc.cam);
+  if (targetRT) {
+    renderer.toneMapping = prevTM;
+    renderer.outputColorSpace = prevCS;
+  }
+  if (mainFxaaChroma) {
+    const cVal = Math.min(CONFIG.render.chromaMax, spdFrac * CONFIG.render.chromaMax);
+    if (player === 0) mainFxaaChroma.uniforms.chromaTop.value = cVal;
+    else mainFxaaChroma.uniforms.chromaBot.value = cVal;
+  }
+}
+
+/* ---- HUD panels + Phase 5 Overlays (Ship Select, Countdown, Finish) ----- */
+let dividerEl = null, selectEl = null, bannerEl = null, finishEl = null;
+let selectScene = null, selectCam = null, selectMeshes = [];
+
+function fmtTime(ms) {
+  if (!ms || ms <= 0 || !Number.isFinite(ms)) return '--:--.--';
+  const totalSec = ms / 1000;
+  const mins = Math.floor(totalSec / 60);
+  const secs = Math.floor(totalSec % 60);
+  const cs = Math.floor((ms % 1000) / 10);
+  return `${mins}:${String(secs).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+function makeDivider() {
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;left:0;right:0;top:50%;height:2px;transform:translateY(-1px);' +
+                     'background:linear-gradient(90deg,rgba(25,200,255,.35),rgba(255,47,208,.75),rgba(25,200,255,.35));' +
+                     'box-shadow:0 0 10px rgba(25,200,255,.55);pointer-events:none;z-index:5;';
+  document.body.appendChild(el);
+  return el;
+}
+
+function makeHudPanel(player) {
+  const el = document.createElement('div');
+  const col = CONFIG.ships.colors[player];
+  el.style.cssText = `position:fixed;left:${CONFIG.hud.marginPx}px;right:${CONFIG.hud.marginPx}px;color:#e6f2ff;z-index:6;` +
+                     `font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;pointer-events:none;display:flex;justify-content:space-between;align-items:flex-start;` +
+                     (player === 0 ? `top:${CONFIG.hud.marginPx}px;` : `top:calc(50% + ${CONFIG.hud.marginPx}px);`);
+  el.dataset.accent = col;
+  document.body.appendChild(el);
+  return el;
+}
+
+let controlsEl = null;
+function controlsHintHtml() {
+  if (isMobile) {
+    return '<b>MOBILE</b> hold LEFT/RIGHT = airbrake · thrust auto · SWIPE UP = boost · double-tap side = sideshift';
+  }
+  const names = padNames.length ? ` (${padNames.join(', ')})` : '';
+  const via = bridgeOk && padsConnected > 0 ? ' via bridge' : '';
+  const padNote = padsConnected > 0
+    ? `<span style="color:#22d7a0">● ${padsConnected} PAD${padsConnected > 1 ? 'S' : ''}${names}${via}</span> stick steer · ZR/A accel · ZL brake · L/R airbrake · X/Y boost · + start`
+    : `<span style="color:#ffb703">○ no pad</span> — apri Chrome su http://127.0.0.1:8017 e premi un tasto sul Pro Controller · bridge: <code style="opacity:.9">node pad-bridge.mjs</code>`;
+  return '<b>P1</b> WASD · Q/E · L-Shift boost &nbsp;|&nbsp; <b>P2</b> arrows · ,/. · R-Shift &nbsp;|&nbsp; ' +
+         padNote + ' &nbsp;|&nbsp; <span style="opacity:.8">R menu · F1 · F2</span>';
+}
+function updateControlsHint() {
+  if (controlsEl) controlsEl.innerHTML = controlsHintHtml();
+}
+function makeControlsHint() {
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:8px;color:#a8bedb;z-index:6;' +
+                     'font-size:11px;font-family:ui-monospace,monospace;line-height:1.45;text-align:center;' +
+                     'background:rgba(5,8,14,.72);padding:5px 12px;border-radius:6px;border:1px solid rgba(100,150,220,.2);pointer-events:none;';
+  el.innerHTML = controlsHintHtml();
+  document.body.appendChild(el);
+  return el;
+}
+
+function buildShowroom() {
+  if (selectScene) return;
+  selectScene = new THREE.Scene();
+  selectScene.environment = envRT.texture;
+  selectScene.add(new THREE.HemisphereLight('#8cb8ff', '#101830', 1.5));
+  const dir = new THREE.DirectionalLight('#ffffff', 2.4);
+  dir.position.set(4, 8, 6);
+  selectScene.add(dir);
+  selectCam = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+  selectCam.position.set(0, 2.1, 6.4);
+  selectCam.lookAt(0, 0, 0);
+  rebuildShowroomMeshes();
+}
+
+function rebuildShowroomMeshes() {
+  if (!selectScene) return;
+  for (const m of selectMeshes) {
+    selectScene.remove(m);
+    m.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  }
+  selectMeshes = [
+    buildShipMesh(0, state.picks[0]),
+    buildShipMesh(1, state.picks[1]),
+  ];
+  // Pedestal ring under ship in showroom, and add to selectScene!
+  for (let p = 0; p < 2; p++) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(2.0, 2.28, 40),
+      new THREE.MeshBasicMaterial({ color: CONFIG.ships.colors[p], side: THREE.DoubleSide })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = -0.55;
+    selectMeshes[p].add(ring);
+    selectScene.add(selectMeshes[p]);
+  }
+}
+
+function makeSelectOverlay() {
+  const el = document.createElement('div');
+  el.id = 'ship-select-overlay';
+  el.style.cssText = 'position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;justify-content:space-between;' +
+                     'background:radial-gradient(circle at 50% 15%, rgba(16,32,62,.35), rgba(4,6,12,.35));pointer-events:none;' +
+                     'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#eaf4ff;padding:20px 36px 38px;box-sizing:border-box;';
+  document.body.appendChild(el);
+  el.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-action]');
+    if (!btn) return;
+    const act = btn.dataset.action;
+    if (act === 'p1-volt') { state.picks[0] = 'volt'; rebuildShowroomMeshes(); renderSelectUI(); }
+    else if (act === 'p1-arc') { state.picks[0] = 'arc'; rebuildShowroomMeshes(); renderSelectUI(); }
+    else if (act === 'p2-volt') { state.picks[1] = 'volt'; rebuildShowroomMeshes(); renderSelectUI(); }
+    else if (act === 'p2-arc') { state.picks[1] = 'arc'; rebuildShowroomMeshes(); renderSelectUI(); }
+    else if (act === 'mode-ghost') setRaceMode('ghost');
+    else if (act === 'mode-versus') setRaceMode('versus');
+    else if (act === 'clear-ghost') { clearBestGhost(); disposeGhostMesh(); renderSelectUI(); }
+    else if (act === 'start-race') beginCountdown();
+  });
+  return el;
+}
+
+function statBarHtml(label, val, col) {
+  return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px;">` +
+    `<span style="width:68px;opacity:.8;letter-spacing:.5px;text-transform:uppercase">${label}</span>` +
+    `<div style="flex:1;height:7px;background:rgba(255,255,255,.12);border-radius:4px;overflow:hidden;">` +
+    `<div style="width:${val}%;height:100%;background:${col};box-shadow:0 0 8px ${col}"></div></div>` +
+    `<span style="width:28px;text-align:right;font-family:ui-monospace,monospace">${val}</span></div>`;
+}
+
+function setRaceMode(mode) {
+  if (isMobile) mode = 'ghost'; // split-screen versus is desktop-only
+  if (mode !== 'ghost' && mode !== 'versus') return;
+  if (state.mode === mode) return;
+  state.mode = mode;
+  state.ready = [false, false];
+  init(state.picks[0], state.picks[1]);
+  buildShowroom();
+  rebuildShowroomMeshes();
+  renderSelectUI();
+}
+
+function renderSelectUI() {
+  if (!selectEl) return;
+  selectEl.style.display = state.phase === 'select' ? 'flex' : 'none';
+  if (state.phase !== 'select') return;
+  const solo = isGhostMode();
+  const best = ghost.best;
+  const card = (p) => {
+    const pick = state.picks[p];
+    const col = CONFIG.ships.colors[p];
+    const inf = CONFIG.race.shipStatsDisplay[pick];
+    const ready = state.ready[p];
+    const keysHint = p === 0
+      ? (solo ? 'A/D or pad ←/→ ship · W/Space/A READY · Start launch' : 'A/D or pad ←/→ switch · W/Space/A READY · Start launch')
+      : '←/→ or pad ←/→ switch · ↑/R-Shift/A READY · Start launch';
+    return `<div style="width:min(360px,92vw);pointer-events:auto;background:rgba(7,12,24,.82);border:1px solid ${col}66;border-radius:12px;padding:14px 18px;box-shadow:0 8px 32px rgba(0,0,0,.55);margin-top:${isMobile ? 8 : 150}px;">` +
+      `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">` +
+      `<span style="font-weight:800;font-size:15px;color:${col};letter-spacing:1px">${solo || isMobile ? 'YOUR SHIP' : 'PLAYER ' + (p + 1)}</span>` +
+      `<span style="font-size:11px;padding:3px 8px;border-radius:99px;background:${ready ? col : 'rgba(255,255,255,.1)'};color:${ready ? '#040810' : '#cfe3ff'};font-weight:700">${ready ? 'LOCKED IN' : 'SELECTING'}</span></div>` +
+      `<div style="display:flex;gap:8px;margin-bottom:10px;">` +
+      ['volt', 'arc'].map(t => `<button data-action="p${p + 1}-${t}" style="flex:1;cursor:pointer;padding:8px 0;border-radius:7px;border:1px solid ${pick === t ? col : 'rgba(255,255,255,.18)'};background:${pick === t ? col + '2b' : 'rgba(255,255,255,.04)'};color:#fff;font-weight:800;letter-spacing:1.5px;font-size:14px">${t.toUpperCase()}</button>`).join('') +
+      `</div>` +
+      `<div style="font-size:12px;color:#b4cae8;margin-bottom:10px;min-height:18px">${inf.desc}</div>` +
+      statBarHtml('Speed', inf.speed, col) +
+      statBarHtml('Handling', inf.handling, col) +
+      statBarHtml('Thrust', inf.thrust, col) +
+      `<div style="margin-top:10px;font-size:11px;opacity:.75;font-family:ui-monospace,monospace;text-align:center">${keysHint}</div>` +
+      `</div>`;
+  };
+  const ghostCard =
+    `<div style="width:min(360px,92vw);pointer-events:auto;background:rgba(7,12,24,.82);border:1px solid #9ab6dc66;border-radius:12px;padding:14px 18px;box-shadow:0 8px 32px rgba(0,0,0,.55);margin-top:${isMobile ? 8 : 150}px;">` +
+      `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">` +
+      `<span style="font-weight:800;font-size:15px;color:#9ab6dc;letter-spacing:1px">GHOST</span>` +
+      `<span style="font-size:11px;padding:3px 8px;border-radius:99px;background:${best ? '#22d7a033' : 'rgba(255,255,255,.1)'};color:${best ? '#22d7a0' : '#cfe3ff'};font-weight:700">${best ? 'BEST SAVED' : 'NO RECORD'}</span></div>` +
+      `<div style="font-size:12px;color:#b4cae8;margin-bottom:12px;min-height:18px">${best
+        ? `Race the translucent ghost of your best ${CONFIG.race.totalLaps}-lap run. Beat it to overwrite the local record.`
+        : `First solo run sets the ghost. Finish ${CONFIG.race.totalLaps} laps — that time is saved in this browser.`}</div>` +
+      `<div style="font-family:ui-monospace,monospace;font-size:22px;font-weight:900;color:#fff;margin:8px 0 4px">${best ? fmtTime(best.totalMs) : '--:--.--'}</div>` +
+      `<div style="font-size:11px;color:#9ab6dc;letter-spacing:1px;text-transform:uppercase">${best ? (best.shipType || 'volt').toUpperCase() + ' · localStorage' : 'Awaiting first finish'}</div>` +
+      (best ? `<button data-action="clear-ghost" style="margin-top:14px;cursor:pointer;width:100%;padding:8px 0;border-radius:7px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.04);color:#ffb703;font-weight:700;letter-spacing:1px;font-size:12px">CLEAR BEST GHOST</button>` : '') +
+    `</div>`;
+  const modeBtn = (id, label) => {
+    const on = state.mode === id;
+    return `<button data-action="mode-${id}" style="cursor:pointer;padding:8px 16px;border-radius:999px;border:1px solid ${on ? '#19c8ff' : 'rgba(255,255,255,.2)'};background:${on ? 'rgba(25,200,255,.22)' : 'rgba(255,255,255,.04)'};color:#fff;font-weight:800;letter-spacing:1.2px;font-size:12px">${label}</button>`;
+  };
+  const mobileSubtitle = isMobile
+    ? 'Mobile · hold L/R airbrake · auto thrust · swipe up boost'
+    : (solo ? '1 Player · Ghost Challenge' : 'Split-Screen Versus');
+  const launchHint = isMobile
+    ? 'TAP LAUNCH · landscape recommended'
+    : ('ENTER / SPACE / <b>+</b> on pad' +
+      (padsConnected ? ` · <span style="color:#22d7a0">PAD OK${padNames[0] ? ': ' + padNames[0] : ''}</span>` : ` · <span style="color:#ffb703">pad offline — node pad-bridge.mjs</span>`));
+  selectEl.innerHTML =
+    `<div style="text-align:center;margin-top:2px;">` +
+      `<div style="font-size:${isMobile ? 28 : 34}px;font-weight:900;letter-spacing:6px;text-shadow:0 0 22px rgba(25,200,255,.65)">STEP<span style="color:#19c8ff">OUT</span></div>` +
+      `<div style="font-size:12px;letter-spacing:3px;color:#9ab6dc;text-transform:uppercase;margin-top:4px">${mobileSubtitle} · ${CONFIG.race.totalLaps} Laps</div>` +
+      (isMobile ? '' : `<div style="display:flex;gap:10px;justify-content:center;margin-top:12px;pointer-events:auto;">${modeBtn('ghost', '1P GHOST')} ${modeBtn('versus', '2P VERSUS')}</div>`) +
+    `</div>` +
+    `<div style="display:flex;flex-direction:${isMobile ? 'column' : 'row'};justify-content:space-between;align-items:center;gap:${isMobile ? 12 : 24}px;my:auto;max-height:${isMobile ? '78vh' : 'none'};overflow:auto;">` +
+      card(0) +
+      `<div style="text-align:center;pointer-events:auto;order:${isMobile ? -1 : 0};">` +
+        `<button id="start-race-btn" data-action="start-race" style="cursor:pointer;padding:${isMobile ? '16px 36px' : '14px 30px'};font-size:${isMobile ? 18 : 16}px;font-weight:900;letter-spacing:2.5px;color:#040810;background:linear-gradient(90deg,#19c8ff,#ff2fd0);border:none;border-radius:999px;box-shadow:0 0 26px rgba(25,200,255,.55)">LAUNCH RACE</button>` +
+        `<div style="margin-top:8px;font-size:12px;color:#bcd2f0;font-family:ui-monospace,monospace">${launchHint}</div>` +
+      `</div>` +
+      (solo || isMobile ? ghostCard : card(1)) +
+    `</div>` +
+    `<div style="height:24px"></div>`;
+}
+
+function makeBannerOverlay() {
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:15;pointer-events:none;' +
+                     'font-family:system-ui,-apple-system,sans-serif;font-size:74px;font-weight:900;letter-spacing:6px;' +
+                     'color:#ffffff;text-shadow:0 0 28px #19c8ff, 0 0 56px #ff2fd0;display:none;';
+  document.body.appendChild(el);
+  return el;
+}
+
+function makeFinishOverlay() {
+  const el = document.createElement('div');
+  el.id = 'finish-overlay';
+  el.style.cssText = 'position:fixed;inset:0;z-index:22;display:none;flex-direction:column;align-items:center;justify-content:center;' +
+                     'background:rgba(4,7,15,.82);backdrop-filter:blur(5px);font-family:system-ui,-apple-system,sans-serif;color:#eaf4ff;';
+  el.addEventListener('click', (ev) => {
+    const act = ev.target.closest('[data-action]')?.dataset.action;
+    if (act === 'rematch') beginCountdown();
+    else if (act === 'ship-select') openShipSelect();
+  });
+  document.body.appendChild(el);
+  return el;
+}
+
+function renderFinishUI() {
+  if (!finishEl) return;
+  if (state.phase !== 'finished') { finishEl.style.display = 'none'; return; }
+  finishEl.style.display = 'flex';
+  if (isGhostMode()) {
+    const s = ships[0];
+    const col = CONFIG.ships.colors[0];
+    const res = ghost.result || {};
+    const title = res.newRecord ? 'NEW GHOST RECORD!' : (res.prevBest && res.totalMs >= res.prevBest ? 'GHOST WINS' : 'RACE COMPLETE');
+    const titleCol = res.newRecord ? '#22d7a0' : col;
+    const delta = res.prevBest ? (res.totalMs - res.prevBest) : null;
+    const deltaStr = delta == null ? '' : (delta < 0
+      ? `<span style="color:#22d7a0">−${fmtTime(Math.abs(delta))}</span> vs old best`
+      : `<span style="color:#ff6b8a">+${fmtTime(delta)}</span> vs ghost`);
+    const saveNote = res.newRecord
+      ? (res.saved ? ` · ghost saved (${res.frames || 0} frames)` : ` · <span style="color:#ffb703">save failed — retry</span>`)
+      : (res.frames ? ` · recorded ${res.frames} frames` : '');
+    finishEl.innerHTML =
+      `<div style="background:rgba(8,14,28,.92);border:1px solid ${titleCol}88;border-radius:16px;padding:28px 40px;min-width:480px;text-align:center;box-shadow:0 0 42px rgba(0,0,0,.75);">` +
+        `<div style="font-size:13px;letter-spacing:3px;color:#9ab6dc;text-transform:uppercase">1P Ghost · ${CONFIG.race.totalLaps} Laps</div>` +
+        `<div style="font-size:34px;font-weight:900;color:${titleCol};letter-spacing:3px;margin:6px 0 14px;text-shadow:0 0 20px ${titleCol}88">${title}</div>` +
+        `<div style="font-family:ui-monospace,monospace;font-size:28px;font-weight:900;margin-bottom:6px">${fmtTime(s.totalRaceMs)}</div>` +
+        `<div style="font-size:13px;color:#b4cae8;margin-bottom:18px">${s.type.toUpperCase()} · Best lap ${fmtTime(s.bestLapMs)}${deltaStr ? ' · ' + deltaStr : ''}${saveNote}</div>` +
+        `<div style="display:flex;gap:12px;justify-content:center;">` +
+          `<button data-action="rematch" style="cursor:pointer;padding:11px 24px;border-radius:99px;border:none;font-weight:800;letter-spacing:1.5px;background:${col};color:#040810">RETRY (SPACE / A)</button>` +
+          `<button data-action="ship-select" style="cursor:pointer;padding:11px 24px;border-radius:99px;border:1px solid rgba(255,255,255,.3);font-weight:700;letter-spacing:1.2px;background:transparent;color:#eaf4ff">MENU (R / B)</button>` +
+        `</div>` +
+      `</div>`;
+    return;
+  }
+  const order = [...ships].sort((a, b) => (a.finishPlace || 9) - (b.finishPlace || 9));
+  const winner = order[0];
+  const winCol = CONFIG.ships.colors[winner.player];
+  finishEl.innerHTML =
+    `<div style="background:rgba(8,14,28,.92);border:1px solid ${winCol}88;border-radius:16px;padding:28px 40px;min-width:480px;text-align:center;box-shadow:0 0 42px rgba(0,0,0,.75);">` +
+      `<div style="font-size:13px;letter-spacing:3px;color:#9ab6dc;text-transform:uppercase">Race Complete</div>` +
+      `<div style="font-size:36px;font-weight:900;color:${winCol};letter-spacing:3px;margin:6px 0 18px;text-shadow:0 0 20px ${winCol}88">PLAYER ${winner.player + 1} (${winner.type.toUpperCase()}) WINS!</div>` +
+      `<div style="display:flex;flex-direction:column;gap:10px;margin-bottom:22px;text-align:left;font-family:ui-monospace,monospace;font-size:14px;">` +
+      order.map((s, idx) => {
+        const c = CONFIG.ships.colors[s.player];
+        return `<div style="display:flex;justify-content:space-between;padding:10px 14px;border-radius:8px;background:rgba(255,255,255,.05);border-left:4px solid ${c}">` +
+          `<span><b>${idx + 1 === 1 ? '1ST' : '2ND'}</b> · P${s.player + 1} ${s.type.toUpperCase()}</span>` +
+          `<span>Total ${s.finished ? fmtTime(s.totalRaceMs) : 'DNF'} · Best ${fmtTime(s.bestLapMs)}</span></div>`;
+      }).join('') +
+      `</div>` +
+      `<div style="display:flex;gap:12px;justify-content:center;">` +
+        `<button data-action="rematch" style="cursor:pointer;padding:11px 24px;border-radius:99px;border:none;font-weight:800;letter-spacing:1.5px;background:${winCol};color:#040810">REMATCH (SPACE / A)</button>` +
+        `<button data-action="ship-select" style="cursor:pointer;padding:11px 24px;border-radius:99px;border:1px solid rgba(255,255,255,.3);font-weight:700;letter-spacing:1.2px;background:transparent;color:#eaf4ff">CHANGE SHIPS (R / B)</button>` +
+      `</div>` +
+    `</div>`;
+}
+
+/* ---- GHOST (1P vs best lap run, localStorage) --------------------------- */
+const GHOST_STRIDE = 12; // t,x,y,z,fx,fy,fz,ux,uy,uz,roll,progress
+const ghost = {
+  best: null,          // { totalMs, shipType, samples: number[] }
+  mesh: null,
+  recording: [],
+  lastSampleT: -1e9,
+  result: null,        // { beat, totalMs, prevBest, newRecord }
+  saveError: null,
+};
+function isGhostMode() { return state.mode === 'ghost'; }
+function ghostFrameCount(samples) {
+  return samples && samples.length ? Math.floor(samples.length / GHOST_STRIDE) : 0;
+}
+function ghostLastT(samples) {
+  const n = ghostFrameCount(samples);
+  return n > 0 ? samples[(n - 1) * GHOST_STRIDE] : 0;
+}
+function ghostLastProgress(samples) {
+  const n = ghostFrameCount(samples);
+  return n > 0 ? samples[(n - 1) * GHOST_STRIDE + 11] : 0;
+}
+/** A real 3-lap ghost must cover most of the race — reject truncated/test leftovers. */
+function isGhostRecordingValid(data) {
+  if (!data || !Array.isArray(data.samples) || !data.totalMs) return false;
+  const n = ghostFrameCount(data.samples);
+  if (n < 90) return false; // ~3s at 30 Hz minimum
+  const lastT = ghostLastT(data.samples);
+  const lastP = ghostLastProgress(data.samples);
+  if (lastT < 12000) return false; // <12s cannot be a full 3-lap run
+  if (lastP < CONFIG.race.totalLaps - 0.2) return false;
+  if (lastT < data.totalMs * 0.85) return false; // timeline truncated vs finish time
+  return true;
+}
+function roundGhostSamples(samples) {
+  const out = new Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const k = i % GHOST_STRIDE;
+    const v = samples[i];
+    // time / progress keep more precision; poses rounded for smaller JSON
+    out[i] = k === 0 || k === 11 ? Math.round(v * 10) / 10 : Math.round(v * 1000) / 1000;
+  }
+  return out;
+}
+function downsampleGhostSamples(samples, maxFrames) {
+  const n = ghostFrameCount(samples);
+  if (n <= maxFrames) return samples;
+  const step = n / maxFrames;
+  const out = [];
+  for (let f = 0; f < maxFrames; f++) {
+    const idx = Math.min(n - 1, Math.floor(f * step));
+    const o = idx * GHOST_STRIDE;
+    for (let k = 0; k < GHOST_STRIDE; k++) out.push(samples[o + k]);
+  }
+  return out;
+}
+function loadBestGhost() {
+  const memory = isGhostRecordingValid(ghost.best) ? ghost.best : null;
+  try {
+    const raw = localStorage.getItem(CONFIG.race.ghostStorageKey);
+    if (!raw) { ghost.best = memory; return memory; }
+    const data = JSON.parse(raw);
+    if (!isGhostRecordingValid(data)) {
+      // Drop truncated leftovers (e.g. old test ghosts) so the next finish can save cleanly
+      try { localStorage.removeItem(CONFIG.race.ghostStorageKey); } catch { /* */ }
+      ghost.best = memory;
+      return memory;
+    }
+    ghost.best = data;
+    return data;
+  } catch {
+    ghost.best = memory;
+    return memory;
+  }
+}
+function saveBestGhost(totalMs, shipType, samples) {
+  ghost.saveError = null;
+  let packed = roundGhostSamples(samples);
+  let data = { totalMs, shipType, samples: packed, savedAt: Date.now(), frames: ghostFrameCount(packed) };
+  ghost.best = data; // keep in memory even if disk write fails
+  const tryWrite = (payload) => {
+    localStorage.setItem(CONFIG.race.ghostStorageKey, JSON.stringify(payload));
+    const check = JSON.parse(localStorage.getItem(CONFIG.race.ghostStorageKey) || 'null');
+    return check && check.samples && check.samples.length === payload.samples.length;
+  };
+  try {
+    if (!tryWrite(data)) throw new Error('verify mismatch');
+  } catch (e1) {
+    // Quota / size — downsample and retry
+    try {
+      packed = roundGhostSamples(downsampleGhostSamples(samples, 1200));
+      data = { totalMs, shipType, samples: packed, savedAt: Date.now(), frames: ghostFrameCount(packed) };
+      ghost.best = data;
+      if (!tryWrite(data)) throw new Error('verify mismatch after downsample');
+    } catch (e2) {
+      ghost.saveError = String(e2.message || e2);
+      console.warn('[ghost] save failed', e2);
+    }
+  }
+  return data;
+}
+function clearBestGhost() {
+  try { localStorage.removeItem(CONFIG.race.ghostStorageKey); } catch { /* */ }
+  ghost.best = null;
+  ghost.saveError = null;
+}
+function disposeGhostMesh() {
+  if (!ghost.mesh) return;
+  scene.remove(ghost.mesh);
+  ghost.mesh.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) {
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) m.dispose();
+    }
+  });
+  ghost.mesh = null;
+}
+function buildGhostMesh(shipType) {
+  disposeGhostMesh();
+  const mesh = buildShipMesh(1, shipType || 'volt');
+  mesh.name = 'ghostShip';
+  mesh.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    const next = mats.map((m) => {
+      const c = m.clone();
+      c.transparent = true;
+      c.opacity = Math.min(0.72, ((c.opacity ?? 1) * 0.62));
+      c.depthWrite = false;
+      if ('emissiveIntensity' in c) c.emissiveIntensity = Math.min(0.35, (c.emissiveIntensity || 0) * 0.65);
+      return c;
+    });
+    o.material = Array.isArray(o.material) ? next : next[0];
+  });
+  mesh.visible = false;
+  scene.add(mesh);
+  ghost.mesh = mesh;
+  return mesh;
+}
+function shipProgress(ship) {
+  const N = CONFIG.track.samples;
+  return ship.lap + ((ship.trackIdx % N) / N);
+}
+function raceElapsedMs(nowMs) {
+  if (!(state.raceStartMs > 0)) return 0;
+  return Math.max(0, nowMs - state.raceStartMs);
+}
+function pushGhostPose(t, s) {
+  const f = s.forward, u = s.up, p = s.pos;
+  ghost.recording.push(
+    t, p.x, p.y, p.z,
+    f.x, f.y, f.z,
+    u.x, u.y, u.z,
+    s.visualRoll || 0,
+    shipProgress(s)
+  );
+}
+function recordGhostSample(nowMs) {
+  if (!isGhostMode() || state.phase !== 'racing') return;
+  const s = ships[0];
+  if (!s || s.finished) return;
+  const t = raceElapsedMs(nowMs);
+  if (t <= 0) return;
+  const minDt = 1000 / CONFIG.race.ghostSampleHz;
+  if (t - ghost.lastSampleT < minDt) return;
+  ghost.lastSampleT = t;
+  pushGhostPose(t, s);
+}
+function finalizeGhostRecording(ship, totalMs) {
+  // Guarantee a finish pose so playback reaches the end of the race
+  pushGhostPose(totalMs, ship);
+  ghost.lastSampleT = totalMs;
+}
+function ghostSampleAt(samples, t) {
+  const n = ghostFrameCount(samples);
+  if (n <= 0) return null;
+  if (t <= samples[0]) return { i0: 0, i1: 0, a: 0 };
+  const lastT = samples[(n - 1) * GHOST_STRIDE];
+  if (t >= lastT) return { i0: n - 1, i1: n - 1, a: 0 };
+  let lo = 0, hi = n - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (samples[mid * GHOST_STRIDE] <= t) lo = mid; else hi = mid;
+  }
+  const t0 = samples[lo * GHOST_STRIDE], t1 = samples[hi * GHOST_STRIDE];
+  const a = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+  return { i0: lo, i1: hi, a };
+}
+function readGhostPose(samples, idx, out) {
+  const o = idx * GHOST_STRIDE;
+  out.t = samples[o];
+  out.pos.set(samples[o + 1], samples[o + 2], samples[o + 3]);
+  out.fwd.set(samples[o + 4], samples[o + 5], samples[o + 6]).normalize();
+  out.up.set(samples[o + 7], samples[o + 8], samples[o + 9]).normalize();
+  out.roll = samples[o + 10];
+  out.progress = samples[o + 11];
+}
+const _gA = { t: 0, pos: new THREE.Vector3(), fwd: new THREE.Vector3(), up: new THREE.Vector3(), roll: 0, progress: 0 };
+const _gB = { t: 0, pos: new THREE.Vector3(), fwd: new THREE.Vector3(), up: new THREE.Vector3(), roll: 0, progress: 0 };
+function updateGhostVisual(nowMs) {
+  if (!isGhostMode() || !ghost.mesh) return;
+  const best = ghost.best;
+  if (!best || !best.samples || best.samples.length < GHOST_STRIDE) {
+    ghost.mesh.visible = false;
+    return;
+  }
+  if (state.phase !== 'racing' && state.phase !== 'finished' && state.phase !== 'countdown') {
+    ghost.mesh.visible = false;
+    return;
+  }
+  const t = state.phase === 'countdown' ? 0 : raceElapsedMs(nowMs);
+  const hit = ghostSampleAt(best.samples, t);
+  if (!hit) { ghost.mesh.visible = false; return; }
+  readGhostPose(best.samples, hit.i0, _gA);
+  readGhostPose(best.samples, hit.i1, _gB);
+  const a = hit.a;
+  ghost.mesh.visible = true;
+  ghost.mesh.position.lerpVectors(_gA.pos, _gB.pos, a);
+  S1.copy(_gA.fwd).lerp(_gB.fwd, a).normalize();
+  S2.copy(_gA.up).lerp(_gB.up, a).normalize();
+  S3.crossVectors(S2, S1).normalize();
+  S2.crossVectors(S1, S3).normalize();
+  M4.makeBasis(S3, S2, S1);
+  Q1.setFromRotationMatrix(M4);
+  const roll = _gA.roll + (_gB.roll - _gA.roll) * a;
+  Q2.setFromAxisAngle(S1, roll);
+  ghost.mesh.quaternion.multiplyQuaternions(Q2, Q1);
+}
+function ghostTimeAtProgress(progress) {
+  const samples = ghost.best?.samples;
+  if (!samples || samples.length < GHOST_STRIDE) return null;
+  const n = ghostFrameCount(samples);
+  if (progress <= samples[11]) return samples[0];
+  const lastP = samples[(n - 1) * GHOST_STRIDE + 11];
+  if (progress >= lastP) return samples[(n - 1) * GHOST_STRIDE];
+  let lo = 0, hi = n - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (samples[mid * GHOST_STRIDE + 11] <= progress) lo = mid; else hi = mid;
+  }
+  const p0 = samples[lo * GHOST_STRIDE + 11], p1 = samples[hi * GHOST_STRIDE + 11];
+  const t0 = samples[lo * GHOST_STRIDE], t1 = samples[hi * GHOST_STRIDE];
+  const a = p1 > p0 ? (progress - p0) / (p1 - p0) : 0;
+  return t0 + (t1 - t0) * a;
+}
+function ghostDeltaMs(ship, nowMs) {
+  if (!ghost.best || state.phase !== 'racing' || !ship) return null;
+  const gT = ghostTimeAtProgress(shipProgress(ship));
+  if (gT == null) return null;
+  return raceElapsedMs(nowMs) - gT;
+}
+function commitGhostFinish(ship, totalMs) {
+  finalizeGhostRecording(ship, totalMs);
+  const prev = isGhostRecordingValid(ghost.best) ? ghost.best : null;
+  const prevBest = prev?.totalMs || 0;
+  const recordingOk = ghostFrameCount(ghost.recording) >= 90
+    && ghostLastProgress(ghost.recording) >= CONFIG.race.totalLaps - 0.2
+    && ghostLastT(ghost.recording) >= totalMs * 0.85;
+  const beat = !prevBest || totalMs < prevBest;
+  const shouldSave = recordingOk && beat;
+  if (shouldSave) saveBestGhost(totalMs, ship.type, ghost.recording.slice());
+  ghost.result = {
+    beat: shouldSave || (beat && recordingOk),
+    newRecord: shouldSave,
+    totalMs,
+    prevBest: prevBest || null,
+    frames: ghostFrameCount(ghost.recording),
+    saved: shouldSave && !ghost.saveError,
+    saveError: ghost.saveError,
+  };
+}
+
+/* ---- GAME STATE + Race Progression + Fixed-Timestep Loop ---------------- */
+let ships = [], cameras = [], hudPanels = null, rafId = 0;
+const state = {
+  phase: 'select',               // 'select' | 'countdown' | 'racing' | 'finished'
+  mode: 'ghost',                 // 'ghost' (1P vs best) | 'versus' (2P split) — mobile always ghost
+  picks: ['volt', 'arc'],
+  ready: [false, false],
+  countdownStartMs: 0,
+  raceStartMs: 0,
+  input: [{}, {}],
+  showDebug: false,              // F1 toggles developer telemetry; clean player HUD shown by default!
+  fps: 0,
+  lastTime: performance.now(),
+  accumulator: 0,
+  simSteps: 0,
+};
+if (isMobile) state.mode = 'ghost';
+loadBestGhost();
+
+function onMenuKeyDown(code) {
+  if (state.phase === 'select') {
+    if (code === 'Digit1') { setRaceMode('ghost'); return; }
+    if (code === 'Digit2') { setRaceMode('versus'); return; }
+    if (code === 'KeyA' || code === 'KeyD') {
+      state.picks[0] = state.picks[0] === 'volt' ? 'arc' : 'volt';
+      state.ready[0] = false;
+      rebuildShowroomMeshes(); renderSelectUI();
+    } else if (!isGhostMode() && (code === 'ArrowLeft' || code === 'ArrowRight')) {
+      state.picks[1] = state.picks[1] === 'volt' ? 'arc' : 'volt';
+      state.ready[1] = false;
+      rebuildShowroomMeshes(); renderSelectUI();
+    } else if (code === 'Enter') {
+      beginCountdown();
+    } else if (code === 'KeyW' || code === 'Space' || code === 'ShiftLeft') {
+      if (isGhostMode()) {
+        state.ready[0] = true;
+        if (code === 'Space' || state.ready[0]) beginCountdown();
+        else renderSelectUI();
+      } else if (state.ready[0] && (state.ready[1] || code === 'Space')) beginCountdown();
+      else { state.ready[0] = true; if (state.ready[0] && state.ready[1]) beginCountdown(); else renderSelectUI(); }
+    } else if (!isGhostMode() && (code === 'ArrowUp' || code === 'ShiftRight')) {
+      state.ready[1] = true;
+      if (state.ready[0] && state.ready[1]) beginCountdown(); else renderSelectUI();
+    }
+  } else if (state.phase === 'finished') {
+    if (code === 'Space' || code === 'Enter') beginCountdown();
+    else if (code === CONFIG.input.restart) openShipSelect();
+  } else if (code === CONFIG.input.restart) {
+    openShipSelect();
+  }
+}
+
+function openShipSelect() {
+  state.phase = 'select';
+  state.ready = [false, false];
+  if (isMobile) state.mode = 'ghost';
+  touchCtl.pointers.clear();
+  refreshTouchAirbrakes();
+  init(state.picks[0], state.picks[1]);
+  buildShowroom();
+  rebuildShowroomMeshes();
+  if (bannerEl) bannerEl.style.display = 'none';
+  if (finishEl) finishEl.style.display = 'none';
+  renderSelectUI();
+  updateMobileChrome();
+}
+
+function beginCountdown() {
+  if (isMobile) state.mode = 'ghost';
+  touchCtl.pointers.clear();
+  refreshTouchAirbrakes();
+  init(state.picks[0], state.picks[1]);
+  state.phase = 'countdown';
+  state.countdownStartMs = performance.now();
+  state.raceStartMs = 0;
+  if (selectEl) selectEl.style.display = 'none';
+  if (finishEl) finishEl.style.display = 'none';
+  updateMobileChrome();
+}
+
+function raceProgressScore(s) {
+  const N = CONFIG.track.samples;
+  const sIdx = Math.round(CONFIG.track.startLineT * N);
+  const rel = ((s.trackIdx - sIdx) % N + N) % N;
+  return s.lap * N + rel + (s.player === 0 ? 0.001 : 0);
+}
+
+function updateRaceProgress(ship, nowMs) {
+  if (state.phase !== 'racing' || ship.finished) return;
+  const N = CONFIG.track.samples;
+  const sIdx = Math.round(CONFIG.track.startLineT * N);
+  const midIdx = (sIdx + Math.round(CONFIG.race.checkpointMidFrac * N)) % N;
+
+  // Detect passing the mid-lap checkpoint
+  const distToMid = Math.abs(ship.trackIdx - midIdx);
+  if (distToMid < 45) ship.passedMid = true;
+
+  // Detect forward crossing of sIdx
+  const prevRel = ((ship.prevTrackIdx - sIdx) % N + N) % N;
+  const curRel = ((ship.trackIdx - sIdx) % N + N) % N;
+  ship.prevTrackIdx = ship.trackIdx;
+
+  if (prevRel > N * 0.8 && curRel < N * 0.2 && ship.passedMid) {
+    const lapTime = nowMs - ship.lapStartMs;
+    ship.lastLapMs = lapTime;
+    if (!ship.bestLapMs || lapTime < ship.bestLapMs) ship.bestLapMs = lapTime;
+    ship.lapStartMs = nowMs;
+    ship.passedMid = false;
+    ship.lap += 1;
+    if (ship.lap >= CONFIG.race.totalLaps) {
+      ship.finished = true;
+      ship.totalRaceMs = nowMs - state.raceStartMs;
+      if (isGhostMode()) {
+        ship.finishPlace = 1;
+        commitGhostFinish(ship, ship.totalRaceMs);
+        state.phase = 'finished';
+        renderFinishUI();
+      } else {
+        const alreadyDone = ships.filter(x => x !== ship && x.finished).length;
+        ship.finishPlace = alreadyDone + 1;
+        if (ships.every(x => x.finished)) {
+          state.phase = 'finished';
+          renderFinishUI();
+        } else if (!state.finishGraceUntil) {
+          state.finishGraceUntil = nowMs + 8000;
+        }
+      }
+    }
+  }
+}
+
+function disposeShipMesh(s) {
+  if (!s) return;
+  for (const m of [s.mesh, s.reflMesh, s.puddleMesh, s.windGallery]) {
+    if (!m) continue;
+    scene.remove(m);
+    m.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const mat of mats) {
+          // Keep shared soft-particle atlas alive across rematches
+          if (mat.map && mat.map === softParticleTex) mat.map = null;
+          mat.dispose();
+        }
+      }
+    });
+  }
+  s.mesh = null; s.reflMesh = null; s.puddleMesh = null; s.windGallery = null;
+}
+
+function init(p1Type, p2Type) {
+  if (!trackTable.length) buildTrack();
+  if (ships && ships.length) for (const s of ships) disposeShipMesh(s);
+  disposeGhostMesh();
+  if (cameras && cameras.length) {
+    for (const rc of cameras) {
+      scene.remove(rc.cam);
+    }
+  }
+  const t0 = p1Type || state.picks[0] || 'volt';
+  const t1 = p2Type || state.picks[1] || 'arc';
+  state.picks = [t0, t1];
+  loadBestGhost();
+  ghost.recording = [];
+  ghost.lastSampleT = -1e9;
+  ghost.result = null;
+
+  if (isGhostMode()) {
+    ships = [makeShip(0, t0)];
+    ships[0].mesh = buildShipMesh(0, t0);
+    ships[0].windGallery = buildWindGallery(0, t0);
+    ships[0].reflMesh = buildShipReflectionMesh(0);
+    ships[0].puddleMesh = null;
+    scene.add(ships[0].mesh);
+    scene.add(ships[0].reflMesh);
+    scene.add(ships[0].windGallery);
+    if (ghost.best) buildGhostMesh(ghost.best.shipType || t0);
+    cameras = [makeCamera(0)];
+  } else {
+    ships = [makeShip(0, t0), makeShip(1, t1)];
+    ships.forEach((s, i) => {
+      s.mesh = buildShipMesh(i, s.type);
+      s.windGallery = buildWindGallery(i, s.type);
+      s.reflMesh = buildShipReflectionMesh(i);
+      s.puddleMesh = null;
+      scene.add(s.mesh);
+      scene.add(s.reflMesh);
+      scene.add(s.windGallery);
+    });
+    cameras = [makeCamera(0), makeCamera(1)];
+  }
+  buildTrails();
+  buildComposers();
+  if (!dividerEl) dividerEl = makeDivider();
+  if (!hudPanels) hudPanels = [makeHudPanel(0), makeHudPanel(1)];
+  if (!controlsEl) controlsEl = makeControlsHint();
+  refreshPadCount();
+  if (!selectEl) selectEl = makeSelectOverlay();
+  if (!bannerEl) bannerEl = makeBannerOverlay();
+  if (!finishEl) finishEl = makeFinishOverlay();
+  for (let p = 0; p < ships.length; p++) {
+    const s = ships[p], rc = cameras[p], g = trackTable[s.trackIdx];
+    rc.offset.copy(g.tangent).multiplyScalar(-CONFIG.camera.backDistance).addScaledVector(g.up, CONFIG.camera.upDistance);
+    rc.pos.copy(s.pos).add(rc.offset);
+    rc.vel.set(0, 0, 0);
+  }
+  state.finishGraceUntil = 0;
+  state.lastTime = performance.now();
+  state.accumulator = 0;
+  onResize();
+}
+
+function renderShowroomOverlay(nowMs) {
+  if (!selectScene || selectMeshes.length < 2) return;
+  const w = window.innerWidth, h = window.innerHeight;
+  const boxW = Math.min(340, Math.floor(w * 0.24)), boxH = Math.min(200, Math.floor(h * 0.24));
+  selectCam.aspect = boxW / Math.max(1, boxH);
+  selectCam.updateProjectionMatrix();
+
+  // Render rotating P1 ship above/beside P1 card (left) and P2 ship on right
+  const positions = [
+    [Math.floor(w * 0.18 - boxW * 0.5 + 90), Math.floor(h * 0.62)],
+    [Math.floor(w * 0.82 - boxW * 0.5 - 90), Math.floor(h * 0.62)],
+  ];
+  for (let p = 0; p < 2; p++) {
+    selectMeshes[0].visible = p === 0;
+    selectMeshes[1].visible = p === 1;
+    selectMeshes[p].rotation.y = nowMs * 0.0014 + p * 0.8;
+    selectMeshes[p].rotation.x = Math.sin(nowMs * 0.002 + p) * 0.1;
+    renderer.setScissorTest(true);
+    renderer.setViewport(positions[p][0], positions[p][1], boxW, boxH);
+    renderer.setScissor(positions[p][0], positions[p][1], boxW, boxH);
+    renderer.clearDepth();
+    renderer.render(selectScene, selectCam);
+  }
+}
+
+function frame(now) {
+  rafId = requestAnimationFrame(frame);
+  window.__frameCount = (window.__frameCount || 0) + 1;
+  const dtMs = Math.min(250, Math.max(0, now - state.lastTime));
+  state.lastTime = now;
+  if (dtMs > 0.1) state.fps = state.fps ? state.fps * 0.95 + (1000 / dtMs) * 0.05 : 1000 / dtMs;
+  if (window.__updateDebugVisibility) window.__updateDebugVisibility();
+
+  // Countdown progression: 3 - 2 - 1 - GO!
+  if (state.phase === 'countdown') {
+    const elapsed = now - state.countdownStartMs;
+    const beat = CONFIG.race.countdownBeatMs;
+    const stepIdx = Math.floor(elapsed / beat);
+    if (stepIdx < 3) {
+      bannerEl.style.display = 'block';
+      bannerEl.textContent = String(3 - stepIdx);
+    } else {
+      state.phase = 'racing';
+      state.raceStartMs = now;
+      for (const s of ships) { s.lapStartMs = now; s.passedMid = false; s.prevTrackIdx = s.trackIdx; }
+      bannerEl.style.display = 'block';
+      bannerEl.textContent = 'GO!';
+    }
+  } else if (state.phase === 'racing') {
+    if (bannerEl && bannerEl.style.display !== 'none') {
+      if (now - state.raceStartMs > CONFIG.race.goBannerMs) bannerEl.style.display = 'none';
+    }
+    if (state.finishGraceUntil && now >= state.finishGraceUntil) {
+      for (const s of ships) if (!s.finished) s.finishPlace = 2;
+      state.phase = 'finished';
+      renderFinishUI();
+    }
+  }
+
+  readInputs();
+  pollGamepadMenu();
+  // Lock driving inputs during select / countdown / finished
+  if (state.phase !== 'racing') {
+    for (let p = 0; p < 2; p++) state.input[p] = { steerX: 0, throttle: false, brakeDown: false, brakeL: false, brakeR: false, boost: false };
+  } else {
+    for (let p = 0; p < ships.length; p++) if (ships[p].finished) {
+      state.input[p] = { steerX: 0, throttle: false, brakeDown: true, brakeL: false, brakeR: false, boost: false };
+    }
+  }
+
+  state.accumulator += dtMs / 1000;
+  const STEP_DT = 1 / CONFIG.physics.fixedHz;
+  let steps = 0;
+  while (state.accumulator >= STEP_DT && steps < CONFIG.physics.maxCatchupSteps) {
+    for (const s of ships) {
+      stepShip(s, STEP_DT);
+      updateRaceProgress(s, now);
+    }
+    stepCollisions();
+    for (const s of ships) checkRespawn(s);
+    state.accumulator -= STEP_DT; state.simSteps++; steps++;
+  }
+  if (state.phase === 'racing') recordGhostSample(now);
+
+  const alpha = state.accumulator / STEP_DT;
+  updateSparks(dtMs / 1000);
+  updateLegoPropsVisual(dtMs / 1000, now);
+  updateGhostVisual(now);
+  const camCount = cameras.length;
+  if (state.phase === 'select') {
+    for (let p = 0; p < camCount; p++) {
+      const idx = Math.floor(((now * 0.04 + p * 900) % CONFIG.track.samples));
+      const f = trackTable[idx], lookF = trackTable[(idx + 28) % CONFIG.track.samples];
+      const rc = cameras[p];
+      rc.cam.position.copy(f.pos).addScaledVector(f.up, 6.5).addScaledVector(f.right, p === 0 ? -4 : 4);
+      rc.cam.up.copy(WORLD_UP);
+      rc.cam.lookAt(lookF.pos);
+    }
+  } else {
+    for (let p = 0; p < ships.length; p++) {
+      S4.lerpVectors(ships[p].prevPos, ships[p].pos, alpha);
+      updateCamera(cameras[p], ships[p], dtMs / 1000, S4);
+    }
+  }
+
+  const solo = isGhostMode();
+  const targetRT = mainComposer ? mainComposer.writeBuffer : null;
+  const rw = window.innerWidth, rh = window.innerHeight;
+  renderer.setRenderTarget(targetRT);
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, rw, rh);
+  renderer.setClearColor(CONFIG.render.clearColor, 1);
+  renderer.clear();
+  renderViewport(0, alpha);
+  if (!solo) renderViewport(1, alpha);
+
+  if (!solo && targetRT) {
+    const band = Math.max(14, Math.round(12 * renderer.getPixelRatio()));
+    const midY = Math.floor(rh / 2) - Math.floor(band / 2);
+    renderer.setRenderTarget(targetRT);
+    renderer.setScissorTest(true);
+    renderer.setViewport(0, midY, rw, band);
+    renderer.setScissor(0, midY, rw, band);
+    renderer.setClearColor(0x000000, 1);
+    renderer.clear(true, true, true);
+  }
+
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, rw, rh);
+  if (mainComposer) {
+    mainComposer.swapBuffers();
+    mainComposer.render();
+  }
+
+  if (state.phase === 'select') {
+    renderer.setRenderTarget(null);
+    renderShowroomOverlay(now);
+  }
+
+  const showHud = state.phase !== 'select';
+  const wantP2 = showHud && !solo;
+  if (hudPanels[0]._vis !== showHud || hudPanels[1]._visP2 !== wantP2) {
+    hudPanels[0]._vis = showHud;
+    hudPanels[1]._visP2 = wantP2;
+    hudPanels[0].style.display = showHud ? 'flex' : 'none';
+    hudPanels[1].style.display = wantP2 ? 'flex' : 'none';
+    if (dividerEl) dividerEl.style.display = wantP2 ? 'block' : 'none';
+  }
+  if (showHud && (!state._lastHudAt || now - state._lastHudAt >= 32)) {
+    state._lastHudAt = now;
+    const fpsStr = state.fps.toFixed(0);
+    hudPanels[0].innerHTML = hudText(0, fpsStr, now);
+    if (wantP2) hudPanels[1].innerHTML = hudText(1, fpsStr, now);
+  }
+  updateMobileChrome();
+}
+
+function hudText(player, fpsStr, nowMs) {
+  const s = ships[player];
+  if (!s) return '';
+  const other = ships[1 - player];
+  const f = trackTable[s.trackIdx];
+  const col = CONFIG.ships.colors[player];
+  const kmh = Math.round(s.velocity.length() * 10.8);
+  const mps = s.velocity.length().toFixed(1);
+  const solo = isGhostMode();
+  let posStr = '1ST';
+  if (!solo && other) {
+    const posRank = s.finished ? s.finishPlace : (raceProgressScore(s) >= raceProgressScore(other) ? 1 : 2);
+    posStr = posRank === 1 ? '1ST' : '2ND';
+  } else if (solo) {
+    const d = ghostDeltaMs(s, nowMs);
+    if (d == null) posStr = ghost.best ? 'GHOST' : 'SOLO';
+    else posStr = d <= 0 ? 'AHEAD' : 'BEHIND';
+  }
+  const curLapNum = Math.min(CONFIG.race.totalLaps, s.lap + 1);
+  const curLapTime = state.phase === 'racing' && !s.finished ? fmtTime(nowMs - s.lapStartMs) : (s.finished ? fmtTime(s.totalRaceMs) : '0:00.00');
+  const boostPct = Math.max(0, Math.min(100, s.boostEnergy));
+  const raceTime = state.phase === 'racing' ? fmtTime(nowMs - state.raceStartMs) : fmtTime(s.totalRaceMs);
+
+  const badges = [];
+  if (solo && ghost.best) {
+    const d = ghostDeltaMs(s, nowMs);
+    if (d != null && state.phase === 'racing' && !s.finished) {
+      const abs = fmtTime(Math.abs(d));
+      badges.push(d <= 0
+        ? `<span style="background:#22d7a0;color:#04100c;padding:2px 8px;border-radius:4px;font-weight:800">GHOST ${abs}</span>`
+        : `<span style="background:#ff4d6d;color:#fff;padding:2px 8px;border-radius:4px;font-weight:800">GHOST +${abs}</span>`);
+    } else {
+      badges.push(`<span style="background:rgba(154,182,220,.25);color:#dce9ff;padding:2px 8px;border-radius:4px;font-weight:700">BEST ${fmtTime(ghost.best.totalMs)}</span>`);
+    }
+  }
+  if (nowMs < s.perfectLandingUntil) badges.push(`<span style="background:#22d7a0;color:#04100c;padding:2px 8px;border-radius:4px;font-weight:800">PERFECT LANDING +BOOST</span>`);
+  else if (nowMs < s.landedFlashUntil) badges.push(`<span style="background:rgba(255,255,255,.2);padding:2px 8px;border-radius:4px;font-weight:700">LANDED</span>`);
+  if (nowMs < s.sideshiftUntil) badges.push(`<span style="background:#a855f7;color:#fff;padding:2px 8px;border-radius:4px;font-weight:800">SIDESHIFT</span>`);
+  if (s.drifting) badges.push(`<span style="background:${col};color:#040810;padding:2px 8px;border-radius:4px;font-weight:800">DRIFT +${Math.round(s.driftStreakSec * 10)}</span>`);
+  if (nowMs < s.wallFlashUntil) badges.push(`<span style="background:#ff4d6d;color:#fff;padding:2px 8px;border-radius:4px;font-weight:800">WALL IMPACT</span>`);
+  if (nowMs < s.legoSmashUntil) badges.push(`<span style="background:#c91a09;color:#fff;padding:2px 8px;border-radius:4px;font-weight:800">LEGO SMASH +BOOST</span>`);
+  if (nowMs < s.legoStudUntil) badges.push(`<span style="background:#f5cd2f;color:#2a1a00;padding:2px 8px;border-radius:4px;font-weight:800">STUD +BOOST</span>`);
+  if (s.fellAt > 0) badges.push(`<span style="background:#ffb703;color:#05060a;padding:2px 8px;border-radius:4px;font-weight:800">RESPAWNING...</span>`);
+
+  const devBlock = state.showDebug ? (
+    `<div style="margin-top:6px;font-family:ui-monospace,monospace;font-size:11px;color:#a8c5ea;background:rgba(4,7,14,.78);padding:5px 8px;border-radius:5px;">` +
+    `spd ${mps} m/s (top ${(s.effTop || 0).toFixed(0)}) · fps ${fpsStr} · ${s.onGround ? 'GND' : 'AIR'} h=${s.height.toFixed(2)}m (comp ${(CONFIG.ships.hoverHeight - s.height).toFixed(2)}m)<br>` +
+    `lane ${s.lane.toFixed(1)}m · slip ${(Math.atan2(s.laneVel, Math.max(1, s.forwardVel)) * 180 / Math.PI).toFixed(1)}° · idx ${s.trackIdx}/${CONFIG.track.samples} · bank ${((f?.bank || 0) * 180 / Math.PI).toFixed(1)}°` +
+    `</div>`
+  ) : '';
+
+  return (
+    `<div style="background:rgba(5,9,18,.72);border-left:3px solid ${col};padding:7px 12px;border-radius:6px;min-width:210px;">` +
+      `<div style="display:flex;align-items:baseline;gap:10px;">` +
+        `<span style="font-weight:900;font-size:18px;color:${col}">${posStr}</span>` +
+        `<span style="font-weight:700;font-size:13px;letter-spacing:1px">${solo ? 'YOU' : 'P' + (player + 1)} · ${shipName(player)}</span>` +
+        `<span style="margin-left:auto;font-family:ui-monospace,monospace;font-size:13px;font-weight:700">LAP ${curLapNum}/${CONFIG.race.totalLaps}</span>` +
+      `</div>` +
+      `<div style="display:flex;justify-content:space-between;font-family:ui-monospace,monospace;font-size:12px;color:#b8d0ef;margin-top:3px;">` +
+        `<span>LAP ${curLapTime}</span>` +
+        `<span>${solo ? 'RACE ' + raceTime : 'BEST ' + fmtTime(s.bestLapMs)}</span>` +
+      `</div>` +
+      (badges.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:11px;">${badges.join('')}</div>` : '') +
+      devBlock +
+    `</div>` +
+    `<div style="background:rgba(5,9,18,.72);border-right:3px solid ${col};padding:7px 12px;border-radius:6px;text-align:right;min-width:165px;">` +
+      `<div style="font-family:ui-monospace,monospace;line-height:1;">` +
+        `<span style="font-size:24px;font-weight:900;color:#fff">${kmh}</span> <span style="font-size:11px;color:#9ab6dc">KM/H</span>` +
+      `</div>` +
+      `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;justify-content:flex-end;">` +
+        `<span style="font-size:10px;letter-spacing:1px;color:#9ab6dc">BOOST</span>` +
+        `<div style="width:92px;height:7px;background:rgba(255,255,255,.14);border-radius:4px;overflow:hidden;">` +
+          `<div style="width:${boostPct.toFixed(0)}%;height:100%;background:${col};box-shadow:0 0 8px ${col}"></div>` +
+        `</div>` +
+      `</div>` +
+    `</div>`
+  );
+}
+function shipName(p) { return ships[p].type.toUpperCase(); }
+
+function onResize() {
+  const w = Math.max(2, window.innerWidth), h = Math.max(4, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.render.maxPixelRatio));
+  renderer.setSize(w, h);
+  const solo = typeof state !== 'undefined' && isGhostMode();
+  const hh = solo ? h : Math.max(2, Math.floor(h / 2));
+  if (cameras && cameras.length) {
+    for (const rc of cameras) { rc.cam.aspect = w / hh; rc.cam.updateProjectionMatrix(); }
+  }
+  if (mainComposer) {
+    buildComposers();
+  }
+}
+window.addEventListener('resize', onResize);
+
+/* ---- DEV verification helpers (kept until phase 7) ---------------------- */
+window.__pump = (n) => { n = n || 1; for (let i = 0; i < n; i++) frame(performance.now() + i * 16.67); };
+window.__physicsChecks = () => {
+  const out = {};
+  const H = CONFIG.ships, P = CONFIG.physics, STEP_DT = 1 / P.fixedHz;
+  const childrenBefore = scene.children.length;
+  init('volt', 'arc');
+  out.noSceneLeakPass = scene.children.length === childrenBefore && trackTable.length === CONFIG.track.samples + 1;
+
+  const put = (pl, o) => { state.input[pl] = Object.assign({ steerX: 0, throttle: false, brakeDown: false, brakeL: false, brakeR: false, boost: false }, o); };
+  const pump = n => { for (let i = 0; i < n; i++) { for (const s of ships) stepShip(s, STEP_DT); stepCollisions(); } };
+  const setup = (pl, type, vF, idxOverride, laneOverride) => {
+    const s = ships[pl];
+    const i0 = idxOverride !== undefined ? idxOverride : Math.round(CONFIG.track.startLineT * CONFIG.track.samples);
+    const f = trackTable[i0];
+    const lane = laneOverride !== undefined ? laneOverride : CONFIG.track.lanes[pl];
+    s.type = type;
+    s.pos.copy(f.pos).addScaledVector(f.right, lane).addScaledVector(f.up, H.hoverHeight);
+    s.prevPos.copy(s.pos);
+    s.velocity.copy(f.tangent).multiplyScalar(vF || 0);
+    s.heading = 0; s.forward.copy(f.tangent); s.up.copy(f.up);
+    if (s.prevTangent) s.prevTangent.copy(f.tangent);
+    s.distAlong = f.dist; s.trackIdx = i0; s.onGround = true; s.prevOnGround = true;
+    s.boostEnergy = H.maxEnergy * H.energyStartFrac;
+    s.lane = lane; s.height = H.hoverHeight; s.visualRoll = 0; s.visualPitch = 0; s.fellAt = 0;
+    s.effTop = H.shipTypes[type].topSpeed;
+  };
+
+  // 1. Top speed & racing-line boost regen finite (regression test for NaN boost bug!)
+  const iStraight = Math.round(0.36 * CONFIG.track.samples);
+  setup(0, 'volt', 25, iStraight, -3.5);
+  put(1, {}); ships[1].pos.set(0, -999, 0);
+  let maxSpd = 0;
+  for (let i = 0; i < 420; i++) {
+    ships[0].lastPadAt = performance.now() + 99999; // isolate pure engine thrust from boost pads
+    const cf = trackTable[ships[0].trackIdx], nf = trackTable[(ships[0].trackIdx + 14) % CONFIG.track.samples];
+    const dir = S5.copy(nf.pos).sub(ships[0].pos).normalize();
+    const errH = wrapAngle(Math.atan2(dir.dot(cf.right), Math.max(0.2, dir.dot(cf.tangent))) - ships[0].heading);
+    const steer = Math.max(-1, Math.min(1, errH * 4));
+    put(0, { steerX: steer, throttle: true });
+    stepShip(ships[0], STEP_DT);
+    maxSpd = Math.max(maxSpd, ships[0].velocity.length());
+  }
+  out.voltTopSpeed = +maxSpd.toFixed(2);
+  out.voltTopSpeedPass = Math.abs(out.voltTopSpeed - H.shipTypes.volt.topSpeed) < 3.5 && ships[0].onGround;
+  out.boostFinitePass = Number.isFinite(ships[0].boostEnergy) && ships[0].boostEnergy > H.maxEnergy * H.energyStartFrac;
+
+  // 2. Overspeed bleed back toward topSpeed
+  const iFlat = Math.round(0.92 * CONFIG.track.samples);
+  setup(1, 'arc', H.shipTypes.arc.topSpeed * (1 + H.boostTopSpeedBonus), iFlat, 0);
+  const over = +ships[1].velocity.length().toFixed(2);
+  for (let i = 0; i < 180; i++) {
+    const cf = trackTable[ships[1].trackIdx], nf = trackTable[(ships[1].trackIdx + 18) % CONFIG.track.samples];
+    const dir = S5.copy(nf.pos).sub(ships[1].pos).normalize();
+    const errH = wrapAngle(Math.atan2(dir.dot(cf.right), Math.max(0.2, dir.dot(cf.tangent))) - ships[1].heading);
+    put(1, { steerX: Math.max(-1, Math.min(1, errH * 4)), throttle: true, boost: false });
+    stepShip(ships[1], STEP_DT);
+  }
+  out.arcOverCapBefore = over; out.arcOverCapAfter = +ships[1].velocity.length().toFixed(2);
+  out.topCapPass = over > H.shipTypes.arc.topSpeed + 2 && Math.abs(out.arcOverCapAfter - H.shipTypes.arc.topSpeed) <= 3.0;
+
+  // 3. Identity: ARC grips tighter than VOLT under identical sideways impulse
+  setup(0, 'arc', 35, undefined, -4); setup(1, 'volt', 35, undefined, 4);
+  put(0, {}); put(1, {});
+  for (const pl of [0, 1]) ships[pl].velocity.addScaledVector(trackTable[ships[pl].trackIdx].right, 18);
+  pump(45);
+  out.arcSlide = +Math.abs(ships[0].velocity.dot(trackTable[ships[0].trackIdx].right)).toFixed(2);
+  out.voltSlide = +Math.abs(ships[1].velocity.dot(trackTable[ships[1].trackIdx].right)).toFixed(2);
+  out.slidePass = out.arcSlide < out.voltSlide * 0.7;
+
+  // 4. Steer+Airbrake combo (D+E) redirects world velocity sideways much faster than plain steering, while solo airbrake pivots into drift!
+  setup(1, 'arc', 40);
+  put(1, { steerX: 1, throttle: true }); for (let i = 0; i < 18; i++) stepShip(ships[1], STEP_DT);
+  const plainRightVel = ships[1].velocity.dot(trackTable[ships[1].trackIdx].right);
+  setup(1, 'arc', 40);
+  put(1, { steerX: 1, brakeR: true, throttle: true }); for (let i = 0; i < 18; i++) stepShip(ships[1], STEP_DT);
+  const comboRightVel = ships[1].velocity.dot(trackTable[ships[1].trackIdx].right);
+  out.airbrakeTurnGain = +(comboRightVel / Math.max(0.1, plainRightVel)).toFixed(2);
+  out.airbrakePass = comboRightVel > plainRightVel * 1.6 && Math.abs(ships[1].heading) > 0.35;
+
+  // 4b. Double-tap Sideshift check: double-tap Q-Q / E-E snaps lateral lane offset without rotating heading!
+  setup(0, 'volt', 45, undefined, 0);
+  ships[0].lastSideshiftAt = -1e9;
+  airbrakeTapState[0].pendingDir = 1; // right sideshift
+  put(0, { throttle: true });
+  for (let i = 0; i < 18; i++) stepShip(ships[0], STEP_DT);
+  out.sideshiftLaneDelta = +ships[0].lane.toFixed(2);
+  out.sideshiftPass = out.sideshiftLaneDelta > 1.2 && Math.abs(ships[0].heading) < 0.12;
+
+  // 5. Real wall collision + bounce (steep angle into right wall actually hits wall & bounces inward)
+  setup(0, 'volt', 40, undefined, 9.5);
+  ships[0].velocity.addScaledVector(trackTable[ships[0].trackIdx].right, 18);
+  put(0, { throttle: true }); put(1, {});
+  let hitWall = false;
+  for (let i = 0; i < 40; i++) {
+    const prevWf = ships[0].wallFlashUntil;
+    stepShip(ships[0], STEP_DT);
+    if (ships[0].wallFlashUntil > prevWf) hitWall = true;
+  }
+  out.wallClampedPass = hitWall && Math.abs(ships[0].lane) <= CONFIG.track.roadHalfWidth - H.wallMargin + 1e-4;
+
+  // 6. Jump gap gravity + airborne state
+  const iGap = Math.round((CONFIG.track.jumpGap[0] + 0.012) * CONFIG.track.samples);
+  setup(0, 'volt', 55, iGap, 0); put(0, { throttle: true });
+  for (let i = 0; i < 20; i++) stepShip(ships[0], STEP_DT);
+  out.gapAirbornePass = !ships[0].onGround && ships[0].velocity.y < -1.0;
+
+  // 7. Ship-vs-ship collision separates overlapping ships and exchanges momentum
+  setup(0, 'volt', 30, undefined, -0.8); setup(1, 'arc', 30, undefined, 0.8);
+  ships[0].velocity.addScaledVector(trackTable[ships[0].trackIdx].right, 8);
+  ships[1].velocity.addScaledVector(trackTable[ships[1].trackIdx].right, -8);
+  stepCollisions();
+  out.collisionPass = ships[0].pos.distanceTo(ships[1].pos) >= H.shipCollisionRadius * 0.95 &&
+                      ships[0].velocity.dot(trackTable[ships[0].trackIdx].right) < 0;
+
+  // 8. Core skill check: hairpin + post-hairpin straight (t=0.15 -> 0.42) with airbrakes beats plain steering!
+  const runHairpin = (type, useAirbrake) => {
+    const N = CONFIG.track.samples, iStart = Math.round(0.15 * N), iEnd = Math.round(0.42 * N);
+    setup(0, type, H.shipTypes[type].topSpeed * 0.98, iStart, -2);
+    put(1, {}); ships[1].pos.set(0, -999, 0);
+    let steps = 0, wallHits = 0;
+    while (ships[0].trackIdx < iEnd && steps < 900) {
+      const cf = trackTable[ships[0].trackIdx], nf = trackTable[(ships[0].trackIdx + 22) % N];
+      const desiredDir = S5.copy(nf.pos).sub(ships[0].pos).normalize();
+      const targetH = Math.atan2(desiredDir.dot(cf.right), Math.max(0.2, desiredDir.dot(cf.tangent)));
+      const errH = wrapAngle(targetH - ships[0].heading);
+      const steer = errH > 0.025 ? 1 : (errH < -0.025 ? -1 : 0);
+      const hardCorner = Math.abs(errH) > 0.16;
+      put(0, {
+        steerX: steer,
+        throttle: true,
+        brakeL: useAirbrake && hardCorner && steer < 0,
+        brakeR: useAirbrake && hardCorner && steer > 0,
+      });
+      const wf = ships[0].wallFlashUntil;
+      stepShip(ships[0], STEP_DT);
+      if (ships[0].wallFlashUntil > wf) wallHits++;
+      steps++;
+    }
+    return { timeSec: +(steps * STEP_DT).toFixed(3), wallHits, exitSpeed: +ships[0].velocity.length().toFixed(1) };
+  };
+  out.hairpinVoltPlain = runHairpin('volt', false);
+  out.hairpinVoltAirbrake = runHairpin('volt', true);
+  out.hairpinArcPlain = runHairpin('arc', false);
+  out.hairpinArcAirbrake = runHairpin('arc', true);
+  out.airbrakeFasterInHairpinPass =
+    out.hairpinVoltAirbrake.timeSec < out.hairpinVoltPlain.timeSec &&
+    out.hairpinArcAirbrake.timeSec < out.hairpinArcPlain.timeSec;
+
+  init('volt', 'arc');
+  out.errorCountPass = window.__errorCount === 0;
+  return out;
+};
+
+window.__scanHalf = (player) => {
+  renderer.setRenderTarget(null);
+  const gl = renderer.getContext(); if (!gl) return 'noGL';
+  const pr = renderer.getPixelRatio(), w = Math.round(window.innerWidth * pr), hh = Math.round((window.innerHeight * pr) / 2);
+  const base = player === 0 ? hh : 0, bw = w, bh = hh;
+  const px = new Uint8Array(bw * bh * 4);
+  gl.readPixels(0, base, bw, bh, gl.RGBA || 6408, gl.UNSIGNED_BYTE, px);
+  let lit = 0, sample = null;
+  for (let i = 0; i < px.length; i += 163) {
+    const r = px[i], g = px[i + 1], b = px[i + 2];
+    if (r + g + b > 40) { lit++; if (!sample) sample = [r, g, b]; }
+  }
+  return { litPixelsSampled: lit, sample };
+};
+
+function startGame() {
+  openShipSelect();
+  if (!rafId) rafId = requestAnimationFrame(frame);
+}
+window.__wipe = { CONFIG, startGame, openShipSelect, beginCountdown, updateRaceProgress, init, frame, stepShip, stepCollisions, checkRespawn, nearestIndex, inGap, trackTable, get state() { return state; }, get ships() { return ships; }, get cameras() { return cameras; }, get ghost() { return ghost; }, clearBestGhost, loadBestGhost, isMobile, touchCtl };
+startGame();
+
+</script>
+</body>
+</html>

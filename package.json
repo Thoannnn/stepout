@@ -1,0 +1,13 @@
+{
+  "name": "stepout",
+  "version": "1.0.0",
+  "description": "StepOut — anti-gravity racer (1P ghost + 2P split-screen)",
+  "private": true,
+  "scripts": {
+    "pad": "node pad-bridge.mjs",
+    "start": "python3 -m http.server 8017 --bind 127.0.0.1"
+  },
+  "dependencies": {
+    "ws": "^8.23.0"
+  }
+}
